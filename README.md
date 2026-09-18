@@ -10,6 +10,10 @@
 
 A lightweight vLLM implementation built from scratch.
 
+## 中文教程
+
+面向零基础读者的完整项目与源码教学请见 [Nano-vLLM 从 0 到 1](NANO_VLLM_ZERO_TO_ONE_ZH.md)。
+
 ## Key Features
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
