@@ -10,9 +10,11 @@
 
 A lightweight vLLM implementation built from scratch.
 
-## 中文教程
+## 中文文档
 
 面向零基础读者的完整项目与源码教学请见 [Nano-vLLM 从 0 到 1](NANO_VLLM_ZERO_TO_ONE_ZH.md)。
+
+项目后续性能、调度、KV Cache、多卡和工程能力的演进建议请见 [Nano-vLLM 未来优化路线图](NANO_VLLM_OPTIMIZATION_ROADMAP_ZH.md)。
 
 ## Key Features
 
