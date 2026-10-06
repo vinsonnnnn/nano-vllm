@@ -234,44 +234,498 @@ __getstate__  # pickle 序列化时调用
 __setstate__  # pickle 反序列化时调用
 ```
 
-装饰器：
+下面详细展开装饰器、dataclass、上下文管理器与断言。普通 Python 示例可以分别保存成小脚本运行；标注为“项目源码”的片段需要结合所在类和模块阅读。
+
+#### 2.11.1 装饰器：把函数或类交给另一个对象处理
+
+先理解一个前提：Python 中的函数也是对象，可以保存到变量中，也可以作为参数传给其他函数。
 
 ```python
-@property
-def is_finished(self): ...
+def say_hello(name):
+    return f"你好，{name}！"
 
-@torch.inference_mode()
-def run_model(...): ...
+greet = say_hello          # 保存函数对象，此时没有执行函数
+print(greet("小明"))      # 调用函数，输出：你好，小明！
 ```
 
-装饰器会改变函数的使用方式或附加行为。`@property` 让方法能像字段一样写成 `seq.is_finished`；`@torch.inference_mode()` 关闭训练所需的梯度记录，节省推理开销。
+`say_hello` 是函数对象，`say_hello("小明")` 才是执行函数得到的返回值。后面阅读 `return wrapper` 时，这个区别特别重要。
 
-dataclass：
+**① `@` 写法实际做了什么？**
 
-```python
-@dataclass(slots=True)
-class SamplingParams:
-    temperature: float = 1.0
-```
-
-`@dataclass` 自动生成保存字段所需的构造函数等代码。`slots=True` 限制实例字段集合并减少一些 Python 对象开销。
-
-上下文管理器：
+假设 `decorate` 是一个接收函数并返回处理后对象的装饰器：
 
 ```python
-with safe_open(file, "pt", "cpu") as f:
+@decorate
+def work():
     ...
 ```
 
-`with` 保证进入和退出资源时执行正确的准备与清理动作，此处用于安全地打开权重文件。
-
-断言：
+从理解机制的角度，它相当于：
 
 ```python
-assert self.temperature > 1e-10
+def work():
+    ...
+
+work = decorate(work)
 ```
 
-条件不成立时立即抛出 `AssertionError`。本项目大量用断言表达只支持哪些输入和配置。
+也就是：创建原函数，把它交给 `decorate`，再把处理后的对象绑定到原来的名字 `work`。常见装饰器返回一个包装函数，但也可以返回其他对象；后面介绍的 `@property` 就会生成属性描述对象。
+
+因此装饰器不是给函数加一条注释，而是确实会影响程序行为。[Python 官方函数定义说明](https://docs.python.org/3/reference/compound_stmts.html#function-definitions)
+
+**② 自己写一个装饰器，观察执行顺序**
+
+下面的例子不依赖 PyTorch，可以直接运行：
+
+```python
+from functools import wraps
+
+def trace(func):
+    print("正在装饰：", func.__name__)
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        print("进入函数：", func.__name__)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            print("离开函数：", func.__name__)
+
+    return wrapper
+
+@trace
+def add(a, b):
+    print("原函数正在计算")
+    return a + b
+
+print("开始调用")
+print("结果：", add(2, b=3))
+```
+
+输出：
+
+```text
+正在装饰： add
+开始调用
+进入函数： add
+原函数正在计算
+离开函数： add
+结果： 5
+```
+
+逐步理解：
+
+1. 执行到 `def add` 的定义时，就调用 `trace(add)`，所以“正在装饰”先打印；这里还没有计算 `2 + 3`。
+2. `trace` 返回 `wrapper`，之后名字 `add` 指向包装函数。
+3. 调用 `add(2, b=3)`，实际先进入 `wrapper`。
+4. `wrapper` 通过保存的 `func` 调用原来的 `add`，拿到结果 `5`。
+5. `finally` 在退出 `try` 时执行，所以先打印“离开函数”，再把结果返回给外层 `print`。
+
+这里的几个新写法：
+
+- `*args`：收集位置参数，例如调用中的 `2`；`args` 是一个 tuple（元组）。
+- `**kwargs`：收集关键字参数，例如 `b=3`；`kwargs` 是一个 dict（字典）。
+- `func(*args, **kwargs)`：把收集到的参数展开，再传给原函数。
+- 内层 `wrapper` 能继续访问外层的 `func`，这种保留外层变量的机制叫“闭包”。
+- `return wrapper` 返回函数对象；写成 `return wrapper()` 就会当场调用它，含义完全不同。
+- `@wraps(func)` 保留原函数的名称、文档字符串等信息，让调试时仍能知道它是 `add`。[functools.wraps 官方说明](https://docs.python.org/3/library/functools.html#functools.wraps)
+
+这个装饰器可以反复用于其他函数。日志、计时、结果缓存和访问控制都可以用类似结构实现。
+
+**③ 为什么有些装饰器带括号，有些不带？**
+
+```python
+@trace                  # 直接把原函数交给 trace
+def first():
+    ...
+
+@repeat(3)              # 先调用 repeat(3)，取得装饰器，再装饰原函数
+def second():
+    ...
+```
+
+带参数的完整例子：
+
+```python
+from functools import wraps
+
+def repeat(times):
+    def decorate(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for _ in range(times):
+                func(*args, **kwargs)
+        return wrapper
+    return decorate
+
+@repeat(3)
+def greet(name):
+    print(f"你好，{name}")
+
+greet("小明")            # 打印三次：你好，小明
+```
+
+可以分成三层看：`repeat(3)` 保存次数并返回 `decorate`；`decorate(greet)` 保存原函数并返回 `wrapper`；`greet("小明")` 才执行包装后的逻辑。
+
+`@repeat(3)` 在这个例子中相当于 `greet = repeat(3)(greet)`。这个包装函数只重复执行，不汇总返回值，因此 `greet(...)` 最后返回 `None`。
+
+**④ 多个装饰器叠加时，顺序是什么？**
+
+下面的 `outer` 和 `inner` 是用于解释顺序的示意名字：
+
+```python
+@outer
+@inner
+def work():
+    ...
+```
+
+应用装饰器的顺序是从靠近函数的一层开始：`work = outer(inner(work))`。如果两层都是前后加逻辑的包装函数，调用通常沿着“外层进入 → 内层进入 → 原函数 → 内层退出 → 外层退出”的顺序执行。换顺序可能改变效果，所以不能随意调整源码中 `@` 的位置。
+
+**⑤ 在 Nano-vLLM 中怎样读这些装饰器？**
+
+| 写法 | 项目位置 | 阅读时可以理解为 |
+|---|---|---|
+| `@property` | `engine/sequence.py` | 把计算结果当作属性读取 |
+| `@classmethod` | `engine/block_manager.py` | 调用时自动提供当前类 `cls` |
+| `@dataclass(slots=True)` | `sampling_params.py`、`config.py` | 自动生成保存配置字段的常用方法 |
+| `@lru_cache(1)` | `layers/rotary_embedding.py` | 最多保留一组参数对应的返回结果 |
+| `@torch.inference_mode()` | `engine/model_runner.py` | 调用时进入推理模式，退出时恢复之前的模式 |
+| `@torch.compile` | Norm、RoPE、激活、Sampler | 为函数建立编译执行路径，可能在调用时触发编译 |
+| `@triton.jit` | `layers/attention.py` | 把函数作为 Triton GPU kernel 定义，按 Triton 方式启动 |
+
+它们都有 `@`，但具体行为由装饰器实现决定。不要理解成“所有装饰器都会加速”。
+
+`@property` 的独立例子：
+
+```python
+class Task:
+    def __init__(self):
+        self._finished = False
+
+    @property
+    def is_finished(self):
+        return self._finished
+
+task = Task()
+print(task.is_finished)       # False，访问时执行属性的 getter
+task._finished = True
+print(task.is_finished)       # True，再次读取时重新计算
+```
+
+有了 `@property`，这里应写 `task.is_finished`，而不是 `task.is_finished()`。后者会试图把返回的布尔值当作函数调用。
+
+项目中的 `seq.num_completion_tokens` 同样是计算属性：它每次读取 `num_tokens - num_prompt_tokens`，不是另存一份可能过期的计数。普通 `property` 不会自动缓存结果；这里也没有 setter，所以不能直接给 `seq.num_completion_tokens` 赋值。
+
+`@classmethod` 方法的第一个参数通常叫 `cls`，表示当前类；普通实例方法的 `self` 表示当前对象。例如项目用 `BlockManager.compute_hash(...)` 调用类方法，不必先创建 BlockManager 实例。
+
+`@lru_cache(1)` 则不同：相同参数再次调用时可以直接返回之前保存的结果。这里最多保存一组参数组合，而不是“只能调用一次”；参数变化可能淘汰旧结果。它缓存的是返回对象的引用，所以共享可变对象时要注意修改会影响其他使用者。
+
+`@torch.inference_mode()` 关闭梯度记录，并减少部分额外追踪开销，适合此处的推理计算。它不会自动加载权重，也不会自动把模型切换成 `model.eval()`。推理模式产生的 Tensor 后续参与需要梯度的计算还有限制。[PyTorch inference_mode 官方说明](https://docs.pytorch.org/docs/stable/generated/torch.autograd.grad_mode.inference_mode.html)
+
+#### 2.11.2 dataclass：为什么配置类只有字段，也能创建对象？
+
+`dataclass` 是“装饰类”的例子。下面是项目 `SamplingParams` 的字段结构：
+
+```python
+from dataclasses import dataclass
+
+@dataclass(slots=True)
+class SamplingParams:
+    temperature: float = 1.0
+    max_tokens: int = 64
+    ignore_eos: bool = False
+
+params = SamplingParams(temperature=0.6, max_tokens=256)
+print(params.temperature)     # 0.6
+print(params.ignore_eos)      # False，使用默认值
+print(params)                # 显示类名和字段值，方便调试
+```
+
+你没有手写 `__init__`，但 dataclass 会根据字段生成构造函数，并默认生成 `__repr__` 和 `__eq__` 等方法。所以这些字段可以被构造、打印和比较。
+
+`slots=True` 减少实例保存字段的开销，并在这个简单类中阻止任意新增属性，例如 `params.unknown = 123` 会报 `AttributeError`。它不意味着字段不可修改；`params.max_tokens = 128` 仍然可以执行。
+
+项目还定义了 `__post_init__`。dataclass 生成的构造函数会在字段赋值后调用它，因此可以检查温度是否合法。`temperature: float` 只是类型标注，dataclass 不会因此自动检查所有输入类型或数值范围。
+
+#### 2.11.3 上下文管理器：进入一段操作，再可靠地退出
+
+“上下文”可以理解为执行一段代码期间临时使用的资源或状态。例如打开文件后进行读取，或暂时进入 GPU Graph 捕获模式。
+
+上下文管理器负责定义进入和退出行为；`with` 是使用它的语法。
+
+**① 从读取文件理解 `with`**
+
+在项目目录运行：
+
+```python
+with open("README.md", "r", encoding="utf-8") as f:
+    first_line = f.readline()
+    print(first_line.strip())
+    print(f.closed)           # False：文件还在使用
+
+print(f.closed)               # True：离开 with 后文件已关闭
+```
+
+执行顺序：
+
+1. `open(...)` 打开文件并取得文件对象；
+2. 进入文件对象的上下文，把进入结果绑定到 `f`；
+3. 执行缩进块中的读取逻辑；
+4. 离开缩进块时，文件上下文管理器关闭文件。
+
+`as f` 得到的是上下文管理器 `__enter__()` 的返回值，未必就是管理器对象本身；文件对象只是通常返回自己。
+
+`with` 不会创建一个新的变量作用域，所以例子中块外仍然可以访问 `f`，只是文件已经关闭，不能继续正常读取。
+
+**② 为什么不能只在最后写 `close()`？**
+
+普通写法：
+
+```python
+f = open("README.md", "r", encoding="utf-8")
+content = f.read()
+f.close()
+```
+
+如果 `f.read()` 抛出异常，最后一行可能来不及执行。用 `try/finally` 可以明确安排清理：
+
+```python
+f = open("README.md", "r", encoding="utf-8")
+try:
+    content = f.read()
+finally:
+    f.close()
+```
+
+对文件读取来说，`with` 把这种配对操作封装起来，避免到处重复写清理逻辑。一般的上下文管理器还可以处理异常，不能把所有 `with` 都简单等同于文件的 `close()`。
+
+**③ `__enter__` 与 `__exit__` 分别做什么？**
+
+可以自己写一个只打印过程的管理器：
+
+```python
+class StudyContext:
+    def __enter__(self):
+        print("进入上下文")
+        return "提供给代码块的值"
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        print("退出上下文")
+        if exc_type is not None:
+            print("发现异常：", exc_type.__name__)
+        return False         # 不吞掉异常，让它继续向外传播
+
+with StudyContext() as value:
+    print(value)
+    print("执行代码块")
+```
+
+输出：
+
+```text
+进入上下文
+提供给代码块的值
+执行代码块
+退出上下文
+```
+
+`__exit__` 的三个参数用于描述块内异常：正常退出时都是 `None`；异常退出时分别是异常类型、异常对象和 traceback（错误发生的调用链信息）。
+
+再运行下面的异常示例，沿用上面定义的 `StudyContext`：
+
+```python
+try:
+    with StudyContext() as value:
+        print("准备触发异常")
+        raise ValueError("示例错误")
+except ValueError as error:
+    print("外层捕获：", error)
+```
+
+输出：
+
+```text
+进入上下文
+准备触发异常
+退出上下文
+发现异常： ValueError
+外层捕获： 示例错误
+```
+
+异常发生后先退出上下文，再由外层 `except` 处理。`__exit__` 返回假值（例如 `False` 或 `None`）时，异常继续传播；如果返回真值，块内异常会被抑制，执行会继续到 `with` 后面。[Python 官方 with 说明](https://docs.python.org/3/reference/compound_stmts.html#the-with-statement)
+
+这里要记住边界：正常返回、`return`、`break` 或块内异常都会触发正常的退出协议；前提是 `__enter__` 已成功。如果进入阶段就失败，Python 不会再自动调用这个管理器的 `__exit__`。强制终止进程时也不能依赖 Python 清理逻辑完成。
+
+**④ 在 Nano-vLLM 中对应哪些操作？**
+
+项目源码 `utils/loader.py`：
+
+```python
+with safe_open(file, "pt", "cpu") as f:
+    for weight_name in f.keys():
+        loaded_weight = f.get_tensor(weight_name)
+```
+
+`safe_open` 提供读取 Safetensors 文件的上下文。代码块通过 `f` 列出权重名称、读取 Tensor；退出时由库完成相应资源的退出处理。`with` 不表示 Tensor 自动复制到 GPU，也不表示块外所有读出的 Tensor 都被删除；权重如何使用仍由 loader 决定。
+
+项目源码 `ModelRunner.capture_cudagraph` 中还有：
+
+```python
+with torch.cuda.graph(graph, self.graph_pool):
+    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+```
+
+这次进入的是 CUDA Graph 捕获环境。块内的 CUDA 工作被记录到 Graph，退出时结束捕获，之后通过 `graph.replay()` 重放。`with` 管理的可以是执行状态，不一定是文件。
+
+`torch.inference_mode()` 也既能写成装饰器，也能写成上下文管理器：
+
+```python
+# 示意：model、input_ids、positions 需先创建
+with torch.inference_mode():
+    hidden_states = model(input_ids, positions)
+```
+
+装饰器形式作用于整个函数调用，上下文形式作用于缩进块；它们控制推理模式的目的相同。
+
+还要与本项目的 `utils/context.py` 区分：里面的 `Context` 是保存 Attention 元数据的 dataclass，靠 `set_context()` 和 `reset_context()` 更新。名字含有 Context 不等于实现了上下文管理器，也不能因此直接写 `with Context():`。
+
+#### 2.11.4 断言：检查“这里应当成立的条件”
+
+**① 基本语法与执行结果**
+
+```python
+assert 条件
+assert 条件, "失败时的说明"
+```
+
+正常 Python 运行模式下，条件为真就继续执行，条件为假就抛出 `AssertionError`：
+
+```python
+temperature = 0.6
+assert temperature > 1e-10, "temperature 必须大于 1e-10"
+print("检查通过")             # 会执行
+```
+
+换成 `temperature = 0.0` 后，会在断言位置抛出异常，后面的 `print` 不会执行，除非外层代码捕获了异常。
+
+从理解普通模式行为的角度，断言类似：
+
+```python
+if not (temperature > 1e-10):
+    raise AssertionError("temperature 必须大于 1e-10")
+```
+
+它不是帮助程序自动纠错，也不会把 `0.0` 调整为一个合法温度。
+
+**② 结合项目理解它在检查什么**
+
+| 项目断言 | 条件成立时的意义 | 不满足时应检查 |
+|---|---|---|
+| `assert os.path.isdir(self.model)` | 模型路径是现有目录 | 路径拼写、目录是否下载完成 |
+| `assert self.kvcache_block_size % 256 == 0` | KV block size 是 256 的倍数 | backend 限制与 block 配置 |
+| `assert 1 <= self.tensor_parallel_size <= 8` | TP 数量在实现允许范围内 | GPU 数量与 TP 设置 |
+| `assert self.temperature > 1e-10` | 当前采样实现允许这个温度 | 本项目当前没有 greedy 分支 |
+| `assert 0 <= i < self.num_blocks` | `Sequence.block(i)` 的逻辑块编号有效 | 调用者是否给错块索引 |
+| `assert block.ref_count == 0` | 待分配/回收的 block 没有活跃引用 | 引用计数和共享 block 生命周期 |
+
+这里既有配置检查，也有“不变量”检查。不变量指算法过程中应始终保持的关系，例如正在被其他请求引用的 KV block 不能被重置给新请求。理解断言经常能直接看出作者对代码的假设。
+
+**③ 断言和异常处理有什么关系？**
+
+`assert` 是产生异常的一种方式；`raise` 可以主动抛出指定异常；`try/except` 则负责在异常发生后处理它：
+
+```python
+def require_positive(value):
+    assert value > 0, "value 应当为正数"
+    return value
+
+try:
+    require_positive(0)
+except AssertionError as error:
+    print("断言失败：", error)
+
+print("异常已被处理，继续执行")
+```
+
+输出：
+
+```text
+断言失败： value 应当为正数
+异常已被处理，继续执行
+```
+
+如果没有对应 `except`，异常会继续向调用者传播；传播到程序顶层仍未处理时，脚本通常以错误退出，并显示 traceback。
+
+在真实 KV Cache 错误中，不能只捕获异常然后继续跑，必须先确认状态能否恢复。例如 ref_count 错误可能说明 block 管理已经不一致。
+
+**④ 为什么用户输入校验更适合 `if + raise`？**
+
+Python 可以以优化模式运行：
+
+```bash
+python -O your_script.py
+```
+
+这时普通 Python `assert` 会被移除，条件也不再求值；设置相应的 `PYTHONOPTIMIZE` 环境变量也会影响断言。因此关键输入校验不应只依赖 `assert`。[Python 官方 assert 说明](https://docs.python.org/3/reference/simple_stmts.html#the-assert-statement)
+
+例如用户传入非法温度，应当明确检查：
+
+```python
+def validate_temperature(temperature):
+    if temperature <= 1e-10:
+        raise ValueError("temperature 必须大于 1e-10")
+    return temperature
+```
+
+这只是改进方式示例，当前项目源码仍然使用断言。可以按用途理解：内部算法不变量常用 `assert`；用户输入、文件路径、权限等必须执行的检查用普通条件判断和明确异常更可靠。
+
+不要把必要操作藏在断言里，例如：
+
+```python
+assert allocate_block()       # 反例：-O 模式下连分配操作都不执行
+```
+
+需要执行的操作应该独立完成，再判断结果。
+
+**⑤ 一个容易写错的形式**
+
+```python
+assert (condition, "说明")    # 错误：检查的是非空 tuple
+assert condition, "说明"      # 正确：检查 condition
+```
+
+非空 tuple 即使包含 `False`，整体仍为真。第一种写法不能达到预期检查效果，Python 通常还会给出警告。若条件复杂，可以只给条件加括号：`assert (a > 0 and b > 0), "说明"`。
+
+#### 2.11.5 把三种概念一起放进执行流程
+
+| 概念 | 典型写法 | 在执行流程中的位置 |
+|---|---|---|
+| 装饰器 | `@trace`、`@property` | 定义时处理函数/类；之后调用或访问使用处理后的对象 |
+| 上下文管理器 | `with manager as value:` | 进入块前准备，离开块时清理或恢复状态 |
+| 断言 | `assert condition, message` | 在当前执行点检查假设，失败时抛异常 |
+
+沿用上面已定义的 `trace` 和 `StudyContext`，可以把它们组合起来：
+
+```python
+@trace
+def checked_add(a, b):
+    with StudyContext():
+        assert a >= 0 and b >= 0, "示例只接受非负数"
+        return a + b
+
+print(checked_add(2, 3))
+```
+
+调用时会先进入装饰器的 `wrapper`，再进入上下文，接着检查断言并计算结果。`return` 离开 `with` 时先执行 `__exit__`，离开包装函数时再执行它的 `finally`，最后把 `5` 返回给最外面的 `print`。
+
+如果改为 `checked_add(-1, 3)`，断言失败后仍会执行上下文的退出操作和包装函数的 `finally`，随后 `AssertionError` 继续向外传播。这解释了为什么“增加函数行为”“管理执行环境”“检查运行假设”可以配合使用。
+
+建议做三个小练习：
+
+1. 给 `add` 再加一次调用，观察“正在装饰”与“进入函数”分别出现几次。
+2. 把 `StudyContext.__exit__` 的返回值暂时改为 `True`，观察异常是否还能到达外层 `except`，然后改回 `False`。
+3. 把断言示例放进脚本，分别用 `python script.py` 和 `python -O script.py` 执行，比较结果；再将断言改为 `if + raise`，观察优化模式下是否仍然检查。
 
 ### 2.12 PyTorch 源码语法速成
 
