@@ -3,6 +3,21 @@
 > 适用代码：本仓库 `nano-vllm 0.2.0`，教程依据当前工作区源码编写。
 > 适合读者：会一点点 Python 更好；完全不了解大语言模型、PyTorch、CUDA 或 vLLM 也可以从头读。
 > 学习目标：不仅会运行示例，还能说清一次文本生成怎样经过调度器、模型、KV Cache 和采样器，最终变成输出文字。
+> 本次修订：2026-10-08。按仓库源码逐一核对对象的创建点、调用者、字段读写和返回路径；保留原有基础章节，补充源码伴读。
+> 源码基线：修订开始时的提交 `44cdb1b`；本次只修改教学文档，不修改推理代码。
+
+## 怎样使用这份笔记
+
+这不是只背术语的笔记。阅读一个对象时，请连续回答五个问题：**在哪里定义？在哪里创建？谁持有它？谁读取或修改它？最后返回什么？**
+
+文中的代码分成两种：
+
+- **源码节选**：上方注明仓库文件和类/方法。需要在原文件中结合缩进和上下文阅读，通常不能单独复制运行；标有“省略”的地方不是完整实现。
+- **教学示例**：使用假设 token、假设采样结果或简化形状，帮助你手算状态。它不代表真实 tokenizer 编号、模型权重或随机输出。
+
+文件链接都相对于项目根目录。可以点击链接，也可以在 VS Code 按 `Ctrl + P` 输入文件路径，再按 `Ctrl + F` 搜索文中指定的 `def` 或 `class`。方法名比固定行号更稳定；你增加注释以后仍然能找到对应代码。
+
+如果现在最困惑的是“Sequence 到底被谁调用”，先读第 **8、11、12、14、21** 章，再返回其余章节。第 11 章有从创建到回收的完整源码追踪。
 
 ---
 
@@ -784,6 +799,23 @@ y = x Wᵀ + b
 
 最后，`@torch.compile` 表示让 PyTorch 尝试编译和融合函数。它不改变函数想表达的数学逻辑，但会影响首次运行耗时、调试方法与最终性能。
 
+### 2.13 把“语法认识”变成“看得懂项目调用”
+
+看代码时，先区别这四种写法：
+
+| 项目实际写法 | 属于什么 | 进入哪里 |
+|---|---|---|
+| `Sequence(prompt, sampling_params)` | 类的构造调用 | `Sequence.__init__()` |
+| `seq.append_token(token_id)` | 普通实例方法调用 | `Sequence.append_token()` |
+| `seq.completion_token_ids` | property 读取 | `completion_token_ids` 的 getter |
+| `self.sampler(logits, temperatures)` | `nn.Module` 对象调用 | `Sampler.forward()` |
+
+前面三项对应 [sequence.py](nanovllm/engine/sequence.py)，最后一项的调用在 [model_runner.py](nanovllm/engine/model_runner.py)，定义在 [sampler.py](nanovllm/layers/sampler.py)。一个“看起来没有函数名的括号调用”并不意味着没有函数执行。
+
+另一个常见困惑是 `self`：在 `LLMEngine.step()` 中，`self` 是引擎；在 `Sequence.append_token()` 中，它是某一条请求；在 `Attention.forward()` 中，它是模型某一层的 Attention 模块。`self` 不是全项目共享的一个万能对象。
+
+阅读每个类时，可以在纸上写下三列：构造函数创建的成员、当前函数接收的参数、当前函数返回的结果。随后用第 7.1 节的表找到上游和下游，避免只盯着一个文件猜它如何运行。
+
 ---
 
 ## 3. 这个项目能做什么、不能做什么
@@ -817,6 +849,18 @@ y = x Wᵀ + b
 
 因此，最合适的定位是“高性能推理原理的可读实现”，不是功能齐全的生产服务。
 
+### 3.3 怎样从源码确认能力，而不是从名字猜
+
+| 能力/限制 | 可以检查的源码证据 |
+|---|---|
+| 支持文字和整数 token 列表 | [llm_engine.py](nanovllm/engine/llm_engine.py) 的 `add_request()` 检查 `isinstance(prompt, str)` |
+| 不是流式接口 | 同一文件的 `generate()` 循环等待全部结束，最后统一 return |
+| 固定 Qwen3 模型实现 | [model_runner.py](nanovllm/engine/model_runner.py) 直接构造 `Qwen3ForCausalLM` |
+| 支持 chunked prefill | [scheduler.py](nanovllm/engine/scheduler.py) 用 `min(num_tokens, remaining)` 分配本轮计划 |
+| 不支持 greedy 参数 | [sampling_params.py](nanovllm/sampling_params.py) 断言温度大于 `1e-10` |
+
+`AutoConfig/AutoTokenizer` 中的 Auto 表示这些工具能选择配置/分词器类型，不代表这个引擎能够自动执行所有 Hugging Face 模型。网络结构仍由项目自己的源码决定。
+
 ---
 
 ## 4. 环境要求：为什么不能直接在普通 Windows 或 CPU 上运行
@@ -840,6 +884,15 @@ y = x Wᵀ + b
 - 模型目录中有配置、tokenizer 和 `*.safetensors` 权重。
 
 ### 4.2 操作系统结论
+
+直接证据位于 [model_runner.py](nanovllm/engine/model_runner.py) 的 `ModelRunner.__init__()`：
+
+```python
+dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+torch.cuda.set_device(rank)
+```
+
+即使只设置单卡，也会执行这两行，代码没有“CPU 时切换到另一个后端”的分支。
 
 推荐顺序：
 
@@ -907,17 +960,45 @@ cd "/mnt/e/AI infra/nano_vllm/nano-vllm"
 
 ### 5.3 创建虚拟环境
 
+先看 [pyproject.toml](pyproject.toml) 中的真实约束：
+
+```toml
+requires-python = ">=3.10,<3.13"
+```
+
+因此不能只凭命令叫 `python3` 就认为版本合适：新 Ubuntu 的默认 Python 可能超出这个范围。先执行 `python3 --version`。本项目学习环境使用 **Python 3.12，目录名 `venv`**。
+
+如果已经创建好 `venv`，跳过创建步骤，只激活它。以下两种创建方式任选一种，不要反复对已有环境执行创建：
+
+已安装 uv 时：
+
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+uv venv --python 3.12 --seed venv
+```
+
+已安装独立的 `python3.12` 及其 venv 支持时：
+
+```bash
+python3.12 -m venv venv
+```
+
+随后在 Ubuntu/WSL 终端执行：
+
+```bash
+source venv/bin/activate
+python --version
+python -c "import sys; print(sys.executable)"
 python -m pip install --upgrade pip setuptools wheel packaging ninja
 ```
 
-以后每次打开新终端都要重新运行：
+Python 路径应指向项目的 `venv/bin/python`。以后每次打开新终端，只需要激活，不需要重新创建环境或重新安装 torch：
 
 ```bash
-source .venv/bin/activate
+cd "/mnt/e/AI infra/nano_vllm/nano-vllm"
+source venv/bin/activate
 ```
+
+`venv` 和 `.venv` 只是目录名，没有谁自动继承谁的关系。创建两个目录就得到两个独立环境；下载缓存可以复用，但包需要安装到实际使用的环境。退出激活状态用 `deactivate`。[uv 官方环境说明](https://docs.astral.sh/uv/pip/environments/)
 
 ### 5.4 安装 PyTorch 与项目
 
@@ -925,7 +1006,7 @@ source .venv/bin/activate
 
 ```bash
 # 先执行 PyTorch 官方安装选择器为你的 CUDA 环境给出的命令
-pip install -e .
+python -m pip install -e . "transformers>=4.51,<5"
 ```
 
 `-e` 表示 editable。修改 `nanovllm/` 下的 Python 文件后，无需反复重新安装。
@@ -943,9 +1024,11 @@ xxhash
 FlashAttention 需要本地编译时，可以尝试在已经安装 PyTorch 后单独执行：
 
 ```bash
-pip install --no-build-isolation flash-attn
-pip install -e .
+python -m pip install --no-build-isolation flash-attn
+python -m pip install -e . "transformers>=4.51,<5"
 ```
+
+这里加上 Transformers `<5` 是本教程的兼容性选择，不是修改了项目原本的依赖声明。FlashAttention 从源码构建还需要匹配的 CUDA toolkit、编译器等；`--no-build-isolation` 只关闭隔离构建环境，不会替你安装 torch 或 CUDA 编译器。如果使用官方预编译 wheel，需要同时匹配 Python、PyTorch、CUDA 和 C++ ABI，不能只看文件名中有 `cu12`。
 
 ### 5.5 检查环境
 
@@ -975,11 +1058,14 @@ GPU count: 1 或更多
 
 ### 5.6 下载模型
 
-安装 Hugging Face 命令行工具：
+安装与上述 Transformers 4.x 学习环境相容的 Hugging Face 工具：
 
 ```bash
-pip install -U huggingface_hub
+python -m pip install "huggingface-hub>=0.34,<1.0"
+python -m pip check
 ```
+
+不要无条件把 `huggingface_hub` 升级到最新大版本。以 `transformers==4.57.6` 为例，它明确要求 `huggingface-hub>=0.34.0,<1.0`；装成 `2.x` 以后，包虽然出现在 `pip show` 中，实际 `import transformers` 仍会失败。[对应版本的官方依赖表](https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/dependency_versions_table.py)
 
 下载示例模型：
 
@@ -1047,6 +1133,23 @@ print(outputs[0]["token_ids"])
 ```
 
 注意：传入普通字符串不等于使用聊天模板。对 instruct/chat 模型，更推荐像 `example.py` 一样先调用 `tokenizer.apply_chat_template(...)`。
+
+### 5.9 VS Code、WSL 和虚拟环境是三个不同层次
+
+```text
+VS Code 窗口连接 WSL: Ubuntu
+  └─ Python 扩展选择项目 venv/bin/python
+      └─ 终端激活同一个 venv 后运行 python example.py
+```
+
+在 Windows 上打开编辑器没有问题，但项目的 Python 和依赖运行在 WSL。仅把终端切成 Ubuntu，不等于编辑器的 Python 检查器也运行在 WSL。
+
+1. 安装微软 WSL 扩展；通过命令面板执行 `WSL: Reopen Folder in WSL`。
+2. 确认左下角显示 `WSL: Ubuntu`，并按需将 Python/Pylance 扩展安装到 WSL。
+3. 执行 `Python: Select Interpreter`，选择 `/mnt/e/AI infra/nano_vllm/nano-vllm/venv/bin/python`。
+4. 在终端执行 `source venv/bin/activate`；再用 `python -c "import sys; print(sys.executable)"` 检查实际运行路径。
+
+这两个路径应指向同一个环境。编辑器环境选择和终端激活是分别设置的，不要只看终端前面的 `(venv)` 就认定检查器也选对了。[VS Code 官方 WSL 说明](https://code.visualstudio.com/docs/remote/wsl)
 
 ---
 
@@ -1144,6 +1247,50 @@ outputs = llm.generate(prompts, params)
 
 虽然 `generate` 源码的返回类型标注写成了 `list[str]`，真实返回值是字典列表，应以实现为准。
 
+### 6.6 为什么 example.py 没写 Sequence，却创建了它？
+
+源码位置：[nanovllm/__init__.py](nanovllm/__init__.py)。完整文件只有：
+
+```python
+from nanovllm.llm import LLM
+from nanovllm.sampling_params import SamplingParams
+```
+
+它把两个名字暴露给使用者。接着打开 [nanovllm/llm.py](nanovllm/llm.py)：
+
+```python
+from nanovllm.engine.llm_engine import LLMEngine
+
+
+class LLM(LLMEngine):
+    pass
+```
+
+`LLM` 没有自己的 `generate()`，所以 `llm.generate(...)` 实际执行继承来的 `LLMEngine.generate()`。`LLM(path, ...)` 同样执行继承来的 `LLMEngine.__init__()`。
+
+现在沿着函数调用进入 [nanovllm/engine/llm_engine.py](nanovllm/engine/llm_engine.py)，在 `generate()` 中找到：
+
+```python
+if not isinstance(sampling_params, list):
+    sampling_params = [sampling_params] * len(prompts)
+for prompt, sp in zip(prompts, sampling_params):
+    self.add_request(prompt, sp)
+```
+
+逐行看：
+
+1. 单个参数对象扩展成与 prompt 数量相同的列表；这不是创建许多独立参数对象，而是重复引用同一个对象。
+2. `zip` 每次取出一个 prompt 和对应的参数 `sp`。
+3. `self.add_request(...)` 接收这一对值，并在内部创建一个 `Sequence`。第 11 章会展开这段源码。
+
+所以“两条 prompt”通常意味着“两条真实请求 Sequence”，而不是把整个 prompts 列表塞入一个 Sequence。模型预热还会创建临时 Sequence，不要把它们算作用户请求。
+
+### 6.7 怎样读成功输出，而不是只看有没有文字
+
+`Generating: 2/2` 表示两条请求都已经结束。输出文本由 `output['text']` 取得，它是 tokenizer 对生成 token IDs 的解码结果，并不是引擎自己拼出来的答案。
+
+如果回答还在 `<think>` 中就截断，检查 `SamplingParams(max_tokens=256)`：上限统计所有新生成 token，思考文本和特殊 token 也会占用额度。可以在教学实验中增加 `max_tokens`，但“程序成功运行”不等于“模型答案一定完整、正确”。
+
 ---
 
 ## 7. 项目目录地图
@@ -1189,6 +1336,35 @@ API 层       LLM / LLMEngine
 计算层       Qwen3 / Attention / Linear / Sampler
 ```
 
+### 7.1 对象定义与调用位置速查
+
+| 想找的对象 | 定义文件 | 创建或主要调用位置 |
+|---|---|---|
+| `LLM` | [llm.py](nanovllm/llm.py) | [example.py](example.py) 的 `main()` |
+| `Config` | [config.py](nanovllm/config.py) | `LLMEngine.__init__()` |
+| `SamplingParams` | [sampling_params.py](nanovllm/sampling_params.py) | `example.main()`；字段被 `Sequence.__init__()` 复制 |
+| `Sequence` | [sequence.py](nanovllm/engine/sequence.py) | `LLMEngine.add_request()`；预热在 `ModelRunner.warmup_model()` |
+| `Scheduler` | [scheduler.py](nanovllm/engine/scheduler.py) | `LLMEngine.__init__()` 创建，`step()` 调用 |
+| `BlockManager` | [block_manager.py](nanovllm/engine/block_manager.py) | `Scheduler.__init__()` 创建，`schedule()/postprocess()/preempt()` 调用 |
+| `ModelRunner` | [model_runner.py](nanovllm/engine/model_runner.py) | `LLMEngine.__init__()` 创建；`step()` 通过 `call('run', ...)` 调用 |
+| `Qwen3ForCausalLM` | [qwen3.py](nanovllm/models/qwen3.py) | `ModelRunner.__init__()` 创建，`run_model()` 调用 |
+| `Attention` | [attention.py](nanovllm/layers/attention.py) | `Qwen3Attention.__init__()` 创建，`Qwen3Attention.forward()` 调用 |
+| `Context` | [context.py](nanovllm/utils/context.py) | `prepare_prefill/decode()` 设置，Attention/LM Head 读取 |
+| `ParallelLMHead` | [embed_head.py](nanovllm/layers/embed_head.py) | `Qwen3ForCausalLM.__init__()` 创建，`compute_logits()` 调用 |
+| `Sampler` | [sampler.py](nanovllm/layers/sampler.py) | `ModelRunner.__init__()` 创建，`run()` 调用 |
+| `load_model` | [loader.py](nanovllm/utils/loader.py) | `ModelRunner.__init__()` 调用 |
+
+### 7.2 怎样在 VS Code 找到“谁使用了这个对象”
+
+以 `Sequence` 为例：
+
+1. `Ctrl + P` 打开 `nanovllm/engine/sequence.py`，找到 `class Sequence`，这是定义。
+2. `Ctrl + Shift + F` 全局搜索 `Sequence(`，这是查找显式创建位置，主要命中 `add_request()` 和 `warmup_model()`。
+3. 再搜索 `append_token(`、`num_cached_tokens`、`block_table`，找到具体方法调用和字段读写。
+4. 在 Python 扩展正常工作的环境中，可以使用“转到定义”和“查找所有引用”。动态调用 `getattr(self, method_name)` 有时无法被静态工具完全追踪，需要手工查看 `ModelRunner.call()`。
+
+不要只搜索 `Sequence(` 就认为找到了全部使用者：后续函数收到的是变量 `seq` 或列表 `seqs`，通常不会再次出现构造类名。
+
 ---
 
 ## 8. 全局架构：一次 generate 调用经过了什么
@@ -1226,6 +1402,8 @@ while not self.is_finished():
 
 而一次 `step()` 做四件事：
 
+下面先用教学伪代码概括；最后一行是中文说明，不是可执行 Python：
+
 ```python
 seqs, is_prefill = self.scheduler.schedule()
 token_ids = self.model_runner.call("run", seqs, is_prefill)
@@ -1234,6 +1412,65 @@ self.scheduler.postprocess(seqs, token_ids, is_prefill)
 ```
 
 理解这四步，就抓住了整个推理引擎的控制骨架。
+
+### 8.1 初始化路径和生成路径不能混为一谈
+
+```text
+创建引擎，只做一次：
+example.main -> LLMEngine.__init__
+  -> Config -> ModelRunner -> Qwen3 + 权重 + 预热 + KV Cache
+  -> tokenizer -> Scheduler
+
+提交并运行请求，可调用多次：
+example.main -> LLMEngine.generate
+  -> add_request -> Sequence -> Scheduler.add
+  -> 循环 step -> schedule -> ModelRunner.run -> postprocess
+  -> decode -> 返回字典列表
+```
+
+第一条路径中的 `warmup_model()` 也执行模型，但输入是假的 token，不是用户的 prompt。不要在初始化断点里等真正的用户问题出现。
+
+### 8.2 真正的 step 源码：输入和返回值是什么
+
+源码位置：[llm_engine.py](nanovllm/engine/llm_engine.py)，`LLMEngine.step()`：
+
+```python
+def step(self):
+    seqs, is_prefill = self.scheduler.schedule()
+    num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+    token_ids = self.model_runner.call("run", seqs, is_prefill)
+    self.scheduler.postprocess(seqs, token_ids, is_prefill)
+    outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+    return outputs, num_tokens
+```
+
+- `seqs` 是本轮被选中的请求对象列表，不一定包含所有请求。
+- `is_prefill` 是这个批次的执行模式。一个 step 不混合 Prefill 和 Decode。
+- `num_tokens` 用于进度条吞吐统计：Prefill 用正数，Decode 用负数。这是统计约定，不是“负数个 token”。
+- `call('run', ...)` 最终进入 `ModelRunner.run()`；调用桥梁详见第 14 章。
+- `postprocess()` 修改这些请求的状态并追加生成 token。
+- `outputs` 只收集本轮已完成的请求；一个未完成的 step 可能返回空列表，不是推理失败，也不是流式输出接口。
+
+### 8.3 请求已经结束，结果怎样回到 example.py？
+
+源码位置：同一文件的 `LLMEngine.generate()`，先看 while 循环内部的结果收集：
+
+```python
+for seq_id, token_ids in output:
+    outputs[seq_id] = token_ids
+    pbar.update(1)
+```
+
+循环全部结束后，继续执行方法尾部：
+
+```python
+pbar.close()
+outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+return outputs
+```
+
+完成时间可能不同，所以先按 `seq_id` 保存，再排序恢复提交顺序。最后才把 token IDs 解码成文字，返回给 `example.py` 的 `outputs` 变量。这里分两块展示，是为了保留“循环内部”和“循环之后”不同的缩进关系。
 
 ---
 
@@ -1297,6 +1534,32 @@ Decode  输入 token 4：    缓存新增 4；    采样 token 5
 
 所以 `last_token` 正是“已经采样，但下一次需要送进模型的 token”。
 
+### 9.5 这个区别在源码中具体体现在哪里
+
+源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`ModelRunner.prepare_prefill()` 循环内的连续节选：
+
+```python
+start = seq.num_cached_tokens
+seqlen_q = seq.num_scheduled_tokens
+end = start + seqlen_q
+seqlen_k = end
+input_ids.extend(seq[start:end])
+positions.extend(range(start, end))
+```
+
+这里的输入是切片：只计算从已缓存位置开始、本轮被调度的部分。无缓存且预算够时，它恰好是完整 prompt；命中前缀或使用 chunked prefill 时，不是完整 prompt。
+
+同一文件的 `prepare_decode()` 循环内则是：
+
+```python
+input_ids.append(seq.last_token)
+positions.append(len(seq) - 1)
+context_lens.append(len(seq))
+slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+```
+
+这里每条序列只添加一个输入 token，但 `context_lens` 告诉 Attention 它可以读取多长的历史缓存。**少输入 token 不等于看不到历史**。
+
 ---
 
 ## 10. 配置系统 Config
@@ -1336,50 +1599,143 @@ self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddi
 
 `LLMEngine.__init__` 会先用 dataclass 字段名过滤 `kwargs`。拼错参数名不会报“未知参数”，而是可能被静默忽略，例如误写 `max_model_length` 不会生效。这是调试配置时必须注意的行为。
 
+### 10.1 谁创建 Config，谁接收它？
+
+源码位置：[llm_engine.py](nanovllm/engine/llm_engine.py)，`LLMEngine.__init__()` 开头：
+
+```python
+config_fields = {field.name for field in fields(Config)}
+config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+config = Config(model, **config_kwargs)
+Sequence.block_size = config.kvcache_block_size
+```
+
+`LLM(path, enforce_eager=True, ...)` 的 `path` 进入 `model`，其他关键字进入 `kwargs`。`fields(Config)` 得到允许的字段名集合，字典推导式保留合法名字，再交给 dataclass 生成的构造函数。构造完成时自动执行 `Config.__post_init__()`，读取模型配置。
+
+这个同一个 `config` 在 rank 0 的初始化路径中被传给 `ModelRunner`，随后传给 `Scheduler`。多进程启动时其他 rank 接收的是序列化后的配置副本，不是跨进程共享一个 Python 对象。
+
+### 10.2 为什么 Config 中两个字段最初是 -1，后来又能使用？
+
+| 字段 | 初始值 | 写入位置 | 使用位置 |
+|---|---|---|---|
+| `num_kvcache_blocks` | `-1` | `ModelRunner.allocate_kv_cache()` 根据显存计算 | `Scheduler.__init__()` 创建 BlockManager |
+| `eos` | `-1` | `LLMEngine.__init__()` 从 tokenizer 读取 | `Scheduler.postprocess()` 判断结束 |
+
+所以初始化顺序很重要：不能先按默认 `-1` 创建缓存管理器，再期待它自动变成正确容量。
+
+另外，`Config` 是引擎级配置，`SamplingParams` 是请求级配置。例如整个引擎只有一个 `max_num_seqs`，但每个请求可以有自己的 `max_tokens`。不要把“单次最多生成多少 token”传成引擎批处理预算。
+
 ---
 
 ## 11. 请求的最小单位 Sequence
 
-每个 prompt 会变成一个 `Sequence` 对象。它同时保存“用户输入”“已经生成的 token”“运行状态”和“KV block 映射”。
+每个 prompt 会变成一个 `Sequence` 对象。它同时保存“用户输入”“已经生成的 token”“运行状态”和“KV block 映射”。但这句话只是概念，下面先找它真正的定义和使用位置。
+
+本章要跟踪的是 **rank 0 中某一条真实请求的同一个 Sequence 对象**。它不是 Qwen3 模型，也不负责矩阵运算；它是让多个管理模块协作的“请求记录”。
+
+### 11.0 先回答：到底在哪个文件、哪段代码使用它？
+
+| 生命周期步骤 | 文件 | 精确到类/方法的位置 | 对 Sequence 做什么 |
+|---|---|---|---|
+| 定义对象 | [sequence.py](nanovllm/engine/sequence.py) | `class Sequence`、`__init__()` | 定义字段和辅助方法 |
+| 创建真实请求 | [llm_engine.py](nanovllm/engine/llm_engine.py) | `LLMEngine.add_request()` | `seq = Sequence(prompt, sampling_params)` |
+| 进入等待队列 | [scheduler.py](nanovllm/engine/scheduler.py) | `Scheduler.add()` | `self.waiting.append(seq)` |
+| 选择本轮请求 | 同上 | `Scheduler.schedule()` | 读长度，写 `num_scheduled_tokens` 和 `status` |
+| 分配缓存 | [block_manager.py](nanovllm/engine/block_manager.py) | `allocate()/may_append()` | 填充 `seq.block_table` |
+| 交给执行器 | [llm_engine.py](nanovllm/engine/llm_engine.py) | `LLMEngine.step()` | 把 `seqs` 传给 `call('run', ...)` |
+| 准备模型输入 | [model_runner.py](nanovllm/engine/model_runner.py) | `prepare_prefill()/prepare_decode()` | 读 token、长度、块表，转换为 Tensor |
+| 准备温度 | 同上 | `prepare_sample()` | 读取 `seq.temperature` |
+| 写回生成结果 | [scheduler.py](nanovllm/engine/scheduler.py) | `postprocess()` | 调用 `seq.append_token(token_id)` |
+| 判断结束、回收 | 同上及 block_manager.py | `postprocess()`、`deallocate()` | 标记 FINISHED，释放 KV block 引用 |
+| 输出到用户 | [llm_engine.py](nanovllm/engine/llm_engine.py) | `step()`、`generate()` | 取 `completion_token_ids`，按 ID 排序并解码 |
+
+还有一个不同用途的创建点：`ModelRunner.warmup_model()` 中的 `Sequence([0] * seq_len)`。这是模拟输入的预热对象，不经过真实请求的 waiting/running 生命周期，不会返回给用户。
 
 ### 11.1 主要字段
 
-| 字段 | 含义 |
-|---|---|
-| `seq_id` | 全局递增请求编号，用来恢复输入顺序 |
-| `status` | `WAITING`、`RUNNING` 或 `FINISHED` |
-| `token_ids` | prompt 与 completion 的完整 token 列表 |
-| `last_token` | 最近采样出的 token |
-| `num_prompt_tokens` | 原始 prompt 长度 |
-| `num_cached_tokens` | 已经有 KV 的 token 数 |
-| `num_scheduled_tokens` | 本轮准备计算多少 token |
-| `is_prefill` | 是否还处于 Prefill/重算路径 |
-| `block_table` | 逻辑 block 到物理 KV block 的 ID 列表 |
-| `temperature` | 当前序列的采样温度 |
-| `max_tokens` | 最多生成长度 |
-| `ignore_eos` | 是否忽略 EOS |
+| 字段 | 含义 | 谁主要读取/修改 |
+|---|---|---|
+| `seq_id` | 当前进程内递增编号，用来恢复请求顺序 | 构造时设置；`LLMEngine.step/generate` 读取 |
+| `status` | `WAITING`、`RUNNING` 或 `FINISHED` | Scheduler 修改；`is_finished` 读取 |
+| `token_ids` | prompt 与 completion 的完整 token 列表 | 构造时复制；`append_token` 添加；Prefill/切片/哈希读取 |
+| `last_token` | 初始为 prompt 最后一个 token，后来是最近采样 token | `append_token` 更新；`prepare_decode` 读取 |
+| `num_tokens` | prompt + 已生成 token 的当前总长度 | 构造和 `append_token` 写；`len(seq)` 返回它 |
+| `num_prompt_tokens` | 原始 prompt 长度，生成时不增加 | completion 切片和计数使用 |
+| `num_cached_tokens` | 当前请求已计算并保留 KV 的 token 数 | BlockManager 设置/重置；Scheduler 每轮增加 |
+| `num_scheduled_tokens` | 本轮准备计算的 token 数 | Scheduler 调度时写、处理完成后清零；Runner 读取 |
+| `is_prefill` | 通信快照需要全 token 列表还是仅末 token | 初始 True；Decode 时 False；抢占时重新 True |
+| `block_table` | 逻辑 block 到物理 KV block 的 ID 列表 | BlockManager 写；Runner 据此计算物理 slot |
+| `temperature` | 当前请求的采样温度 | 构造时复制；`prepare_sample` 读取 |
+| `max_tokens` | 最多新生成多少 token | 构造时复制；Scheduler 判停读取 |
+| `ignore_eos` | 是否忽略 EOS | 构造时复制；Scheduler 判停读取 |
+
+`num_cached_tokens` 不是“历史上总共算过多少 token”：抢占释放缓存后它会归零。`num_tokens` 不会因此归零，已经生成的文字仍然保留。
 
 ### 11.2 状态变化
 
 ```mermaid
 stateDiagram-v2
     [*] --> WAITING: add_request
-    WAITING --> RUNNING: Prefill 全部完成
+    WAITING --> RUNNING: 已安排最后一段 Prefill
     RUNNING --> FINISHED: EOS 或达到 max_tokens
     RUNNING --> WAITING: KV block 不足，被抢占
-    WAITING --> RUNNING: 重新 Prefill 完成
+    WAITING --> RUNNING: 已安排重算最后一段
     FINISHED --> [*]
 ```
 
+这里有一个很重要的实现细节：`schedule()` 在**最后一段 Prefill 被安排、尚未进入 GPU 执行之前**，就把 `status` 改成 RUNNING，并移入 running 队列。这是在同步控制流中提前安排后续状态，不表示此刻 Prefill 的 GPU 计算已经完成。
+
+同样，首次 Prefill 调度结束时可以出现 `status=RUNNING`、`is_prefill=True`。两者不是同一个标志：前者用于请求队列生命周期，后者主要控制 Sequence 的序列化内容；本轮计算模式由 `schedule()` 返回的批次级 `is_prefill` 决定。
+
 ### 11.3 重要属性
 
+源码位置：[sequence.py](nanovllm/engine/sequence.py)，`Sequence` 的三个 property：
+
 ```python
-num_completion_tokens = num_tokens - num_prompt_tokens
-num_blocks = ceil(num_tokens / block_size)
-last_block_num_tokens = 最后一个逻辑块中已有多少 token
+@property
+def num_completion_tokens(self):
+    return self.num_tokens - self.num_prompt_tokens
+
+@property
+def prompt_token_ids(self):
+    return self.token_ids[:self.num_prompt_tokens]
+
+@property
+def completion_token_ids(self):
+    return self.token_ids[self.num_prompt_tokens:]
 ```
 
-`prompt_token_ids` 和 `completion_token_ids` 只是对 `token_ids` 的切片。
+这里没有手动维护第二份 completion 列表，而是按固定的 prompt 边界切片。假设 `token_ids=[10,20,30,40,50]`、`num_prompt_tokens=3`：
+
+```text
+prompt_token_ids     -> [10,20,30]
+completion_token_ids -> [40,50]
+num_completion_tokens -> 5 - 3 = 2
+```
+
+`@property` 让你写 `seq.completion_token_ids`，不是 `seq.completion_token_ids()`。每次读取都会执行 getter。
+
+块相关属性的真实源码：
+
+```python
+@property
+def num_blocks(self):
+    return (self.num_tokens + self.block_size - 1) // self.block_size
+
+@property
+def last_block_num_tokens(self):
+    return self.num_tokens - (self.num_blocks - 1) * self.block_size
+
+def block(self, i):
+    assert 0 <= i < self.num_blocks
+    return self.token_ids[i*self.block_size: (i+1)*self.block_size]
+```
+
+`//` 是整数除法，`(n+b-1)//b` 在正整数条件下实现向上取整。`n=300,b=256` 时需要 2 个逻辑块；第二块中有 `300-256=44` 个 token。
+
+`seq.block(0)` 取得第一个逻辑块的 **token IDs**，不是 K/V Tensor。BlockManager 用它计算哈希；真正的 K/V 数据在 GPU 的 `ModelRunner.kv_cache` 中。
+
+同一类中还定义 `__len__()` 和 `__getitem__()`：所以 `len(seq)` 读取 `num_tokens`，`seq[start:end]` 实际对 `token_ids` 切片。Runner 中看起来像列表的写法，其实正在使用 Sequence 的特殊方法。
 
 ### 11.4 为什么实现 `__getstate__` 和 `__setstate__`
 
@@ -1389,6 +1745,175 @@ last_block_num_tokens = 最后一个逻辑块中已有多少 token
 - Decode 每轮实际只需要 `last_token`，不必反复复制整个长序列。
 
 `__getstate__` 因而在 Decode 只序列化最后一个 token，减少进程通信量。子进程中的 `Sequence` 是执行快照，不负责保存最终输出。
+
+源码位置：[sequence.py](nanovllm/engine/sequence.py)，`Sequence.__getstate__()`：
+
+```python
+def __getstate__(self):
+    last_state = self.last_token if not self.is_prefill else self.token_ids
+    return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+```
+
+调用者不是 `example.py` 直接写 `seq.__getstate__()`。多卡时，[model_runner.py](nanovllm/engine/model_runner.py) 的 `write_shm()` 执行 `pickle.dumps([method_name, *args])`，pickle 遇到 Sequence 时自动使用它的序列化协议。`read_shm()` 调用 `pickle.loads(...)`，相应使用 `__setstate__()` 恢复快照。
+
+Decode 快照把 `token_ids` 设为空列表，只保留 `last_token` 和执行需要的长度、块表。它没有完整的 `status/seq_id/temperature` 等调度字段，不能当作 rank 0 的完整请求对象使用。非零 rank 不执行采样和 Scheduler，因此也不需要这些字段。
+
+### 11.5 创建点逐行展开：add_request → __init__
+
+源码位置：[llm_engine.py](nanovllm/engine/llm_engine.py)，完整的 `LLMEngine.add_request()`：
+
+```python
+def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    if isinstance(prompt, str):
+        prompt = self.tokenizer.encode(prompt)
+    seq = Sequence(prompt, sampling_params)
+    self.scheduler.add(seq)
+```
+
+这四步是你寻找“谁创建 Sequence”时的直接答案：
+
+1. 用户传入文字或 token IDs。
+2. 文字先被 tokenizer 转成整数列表；已经是列表则不再 encode。
+3. `Sequence(...)` 是类的构造调用，Python 进入 `Sequence.__init__()`。
+4. `Scheduler.add(seq)` 把同一个对象加入 waiting 队列。这里没有执行模型，也没有生成答案。
+
+打开 [sequence.py](nanovllm/engine/sequence.py)，构造函数的连续节选：
+
+```python
+self.seq_id = next(Sequence.counter)
+self.status = SequenceStatus.WAITING
+self.token_ids = copy(token_ids)
+self.last_token = token_ids[-1]
+self.num_tokens = len(self.token_ids)
+self.num_prompt_tokens = len(token_ids)
+self.num_cached_tokens = 0
+self.num_scheduled_tokens = 0
+self.is_prefill = True
+self.block_table = []
+self.temperature = sampling_params.temperature
+self.max_tokens = sampling_params.max_tokens
+self.ignore_eos = sampling_params.ignore_eos
+```
+
+- `counter=count()` 是类字段，当前进程内的构造调用共享这个计数器。预热也会消耗编号，所以第一条真实请求不保证 `seq_id==0`；只要真实请求编号保持提交顺序即可。
+- `copy(token_ids)` 复制列表。Sequence 添加输出 token，不会直接修改调用者传入的原列表；其中的整数无需深拷贝。
+- 初始 `last_token` 是 prompt 尾 token，此刻还没有采样结果。
+- `num_prompt_tokens` 固定；后续输出只让 `num_tokens` 增加。
+- 初始 `block_table=[]`，说明尚未由 BlockManager 分配物理缓存块。
+- 采样参数的字段值被复制到 Sequence。提交后再修改原参数对象，不会自动修改已经创建的请求。
+- `token_ids[-1]` 意味着不能传空列表；当前实现没有在这里给出专门的友好报错。
+
+### 11.6 对象怎样交给其他模块：传递的是引用
+
+源码位置：[scheduler.py](nanovllm/engine/scheduler.py)，`Scheduler.add()`：
+
+```python
+def add(self, seq: Sequence):
+    self.waiting.append(seq)
+```
+
+在 rank 0 的同一个 Python 进程里，列表或队列保存的是对象引用。`waiting[0]`、`scheduled_seqs` 中的一个元素、Runner 收到的一个 `seq`，可以指向同一个对象；并不是每传一次函数参数就重新创建一个请求。
+
+独立教学示例，不需要安装模型：
+
+```python
+from types import SimpleNamespace
+
+record = SimpleNamespace(num_tokens=3)
+waiting = [record]
+selected = waiting[0]
+selected.num_tokens += 1
+print(record.num_tokens)       # 4
+print(selected is record)      # True
+```
+
+这解释了为什么 `Scheduler.postprocess()` 修改 `seq` 后，`LLMEngine.step()` 立刻可以从相同对象上读到新状态。跨进程 pickle 则创建执行快照，不属于这种共享引用关系。
+
+### 11.7 谁把生成 token 写进去：postprocess → append_token
+
+源码位置：[scheduler.py](nanovllm/engine/scheduler.py)，完整 `postprocess()`：
+
+```python
+def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    for seq, token_id in zip(seqs, token_ids):
+        self.block_manager.hash_blocks(seq)
+        seq.num_cached_tokens += seq.num_scheduled_tokens
+        seq.num_scheduled_tokens = 0
+        if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            continue
+        seq.append_token(token_id)
+        if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            self.running.remove(seq)
+```
+
+逐行追踪：
+
+1. `zip(seqs, token_ids)` 将批次中每条请求与相同位置的采样结果配对。
+2. 先登记本轮真正算出的完整缓存块，再更新已缓存数量。
+3. 清零本轮计划数，下一轮由 schedule 重写。
+4. 如果这只是未完成的 Prefill 分段，忽略本轮临时采样结果，不追加输出。
+5. 否则调用 `append_token()`，更新请求中的 token 列表。
+6. 追加以后判断 EOS 和生成长度，因此 EOS 本身也可能出现在 completion 中。
+7. 请求结束则归还缓存引用，并从 running 队列移除。
+
+打开 [sequence.py](nanovllm/engine/sequence.py)，完整的被调用方法：
+
+```python
+def append_token(self, token_id: int):
+    self.token_ids.append(token_id)
+    self.last_token = token_id
+    self.num_tokens += 1
+```
+
+它不计算 K/V，也不把新 token 立即写入 GPU cache。新 token 下一轮作为模型输入，才会产生自己的 K/V。这就是第 9 章“缓存落后一个新 token”的源码原因。
+
+### 11.8 手算一次生命周期：字段到底怎样变化
+
+假设输入 `[10,20,30]`，`max_tokens=2`，不命中前缀，假设两次采样为 `40`、`50`，都不是 EOS；物理块 ID 假设为 7。
+
+| 观察时刻 | `token_ids` | `num_tokens` | `num_cached_tokens` | `num_scheduled_tokens` | `status` | `block_table` |
+|---|---|---:|---:|---:|---|---|
+| `add_request()` 之后 | `[10,20,30]` | 3 | 0 | 0 | WAITING | `[]` |
+| 首轮 `schedule()` 之后 | `[10,20,30]` | 3 | 0 | 3 | RUNNING | `[7]` |
+| Prefill 的 `postprocess()` 之后 | `[10,20,30,40]` | 4 | 3 | 0 | RUNNING | `[7]` |
+| Decode 的 `schedule()` 之后 | `[10,20,30,40]` | 4 | 3 | 1 | RUNNING | `[7]` |
+| 第二轮 `postprocess()` 内、追加 50 后且回收前 | `[10,20,30,40,50]` | 5 | 4 | 0 | RUNNING | `[7]` |
+| 第二轮 `postprocess()` 返回之后 | `[10,20,30,40,50]` | 5 | 0 | 0 | FINISHED | `[]` |
+
+最后一行的缓存数量是 **0**，不是 4：`BlockManager.deallocate()` 重置计数并清空块表。token 列表仍在，所以引擎可以提取 `[40,50]` 作为结果。若在断点里看到已完成请求的空块表，不要误以为没有分配过缓存。
+
+### 11.9 直接观察 Sequence，不运行完整模型
+
+在已经装好项目依赖的 WSL 环境中，可以把下面教学脚本保存为临时学习脚本执行；它不创建 LLM、不加载权重、不执行 GPU forward：
+
+```python
+from nanovllm.engine.sequence import Sequence
+from nanovllm.sampling_params import SamplingParams
+
+ids = [10, 20, 30]
+seq = Sequence(ids, SamplingParams(max_tokens=2))
+print(seq.status.name, len(seq), seq.prompt_token_ids)
+seq.append_token(40)
+seq.append_token(50)
+print(seq.completion_token_ids, seq.num_completion_tokens)
+print(ids)
+print(seq.status.name)
+```
+
+预期输出：
+
+```text
+WAITING 3 [10, 20, 30]
+[40, 50] 2
+[10, 20, 30]
+WAITING
+```
+
+最后仍然是 WAITING：`append_token()` 只更新 token，没有自己判断 `max_tokens` 或改变状态。真实请求的 FINISHED 是 Scheduler 设置的。这个实验能分清对象自身的方法和外部调用者的职责。
+
+注意，导入 `nanovllm` 子模块仍然会经过包的 `__init__.py`，因此需要完整依赖；“这个实验不执行 GPU forward”不等于“可以在完全没有 GPU 相关库的 Python 中直接导入”。
 
 ---
 
@@ -1410,7 +1935,7 @@ running：Prefill 已完成，可以逐 token Decode
 3. 分配或引用物理 block；
 4. 遵守 `max_num_batched_tokens` 和 `max_num_seqs`；
 5. 设置本轮 `num_scheduled_tokens`；
-6. 整个 prompt 处理完后，将序列移入 `running`。
+6. 最后一段 Prefill 被安排时，将序列移入 `running`；GPU 计算随后才执行。
 
 只要本轮安排了任意 Prefill，就直接返回 Prefill 批次，不会在同一次模型前向里混入 Decode。
 
@@ -1465,6 +1990,92 @@ GPU 返回每条序列的一个新 token 后：
 4. 真正到达 prompt 尾部后追加新 token；
 5. 遇到 EOS 或达到 `max_tokens` 时标记完成；
 6. 完成后释放 block，并从 running 删除。
+
+### 12.6 Scheduler 在哪里创建，又从哪里被调用？
+
+源码位置：[llm_engine.py](nanovllm/engine/llm_engine.py)，`LLMEngine.__init__()` 的连续节选：
+
+```python
+self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+config.eos = self.tokenizer.eos_token_id
+self.scheduler = Scheduler(config)
+```
+
+引擎创建后，`self.scheduler` 就一直持有这个调度器。`add_request()` 调它的 `add()`，`step()` 调它的 `schedule()` 和 `postprocess()`，`is_finished()` 调它的同名方法。这些调用都在 rank 0 的 CPU 管理路径上，Scheduler 本身不执行神经网络。
+
+源码位置：[scheduler.py](nanovllm/engine/scheduler.py)，`Scheduler.__init__()` 尾部：
+
+```python
+self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+self.waiting: deque[Sequence] = deque()
+self.running: deque[Sequence] = deque()
+```
+
+`deque` 是适合两端添加/删除的队列；`append()` 加到右端，`popleft()` 从左端取出。waiting 和 running 存储的是 Sequence 引用，BlockManager 是调度器内部的资源管理对象。
+
+### 12.7 Prefill 分支：每一行在决定什么
+
+源码位置：同一文件的 `Scheduler.schedule()`，以下是设置本轮预算和转移队列的连续节选：
+
+```python
+seq.num_scheduled_tokens = min(num_tokens, remaining)
+num_batched_tokens += seq.num_scheduled_tokens
+if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+    seq.status = SequenceStatus.RUNNING
+    self.waiting.popleft()
+    self.running.append(seq)
+scheduled_seqs.append(seq)
+```
+
+此前代码已算好 `num_tokens`（仍需计算的 token 数）和 `remaining`（本轮剩余预算）：
+
+- 两者取小值，确定这一请求本轮真正计算多少 token。
+- 加入批次总数，防止后续请求重复使用预算。
+- 如果“已经缓存 + 这次计划”恰好覆盖当前总长度，把它转入 running。
+- 无论这次能否全部算完，被安排的对象都会加入 `scheduled_seqs`，交给 Runner。
+
+教学例子：长度 600、预算 256、无缓存。各轮计划分别为 256、256、88。前两轮结束后 `postprocess()` 的 `continue` 忽略采样，最后一轮才追加第一个 completion token。
+
+`schedule()` 中 `if scheduled_seqs: return scheduled_seqs, True` 是 Prefill 优先的直接证据；它让本轮不会继续进入 Decode 分支。
+
+### 12.8 Decode 与抢占分支：Python 的 while…else 在这里做什么
+
+源码位置：同一文件的 `schedule()`，Decode 循环内：
+
+```python
+seq = self.running.popleft()
+while not self.block_manager.can_append(seq):
+    if self.running:
+        self.preempt(self.running.pop())
+    else:
+        self.preempt(seq)
+        break
+else:
+    seq.num_scheduled_tokens = 1
+    seq.is_prefill = False
+    self.block_manager.may_append(seq)
+    scheduled_seqs.append(seq)
+```
+
+这里的最后一个 `else` 与 **while** 配对，不是与 `if self.running` 配对：while 条件正常结束、没有执行 break 时，才进入它。
+
+1. 取出一条可 Decode 的请求。
+2. 如果没有空间给它追加缓存，优先从 running 尾端抢占其他请求，释放空间。
+3. 如果已没有其他请求可抢占，只能抢占当前请求，并 break，不能继续执行它的 Decode。
+4. 获得足够空间时才设置单 token 计划、必要时追加新块、加入本轮列表。
+
+这一轮执行后，未完成请求仍留在 running；完成请求由 `postprocess()` 删除。连续批处理就是在每轮重新选择这些对象，不是固定一个 batch 一直算到底。
+
+### 12.9 怎么知道主循环应该停？
+
+源码位置：同一文件的 `Scheduler.is_finished()`：
+
+```python
+def is_finished(self):
+    return not self.waiting and not self.running
+```
+
+两条队列都空才结束。不是“第一个请求完成就结束”，也不是“这一轮返回了空 outputs 就结束”。引擎的 `while not self.is_finished()` 最终读取的就是这个条件。
 
 ---
 
@@ -1562,7 +2173,7 @@ slot = 7 × 256 + 10 = 1802
 
 ### 13.6 前缀缓存怎样命中
 
-只缓存完整 block，最后一个不完整 block 不参与复用。每个完整 block 的哈希还包含前一个 block 的哈希：
+当前实现只复用完整的前缀 block，并且查询时**总是排除当前序列的最后一个逻辑 block，即使尾块恰好填满也排除**。这让 Prefill 至少还有尾部 token 可计算，用来取得下一个 token 的 logits。每个候选块的哈希还包含前一个 block 的哈希：
 
 ```text
 h0 = hash(tokens_of_block_0)
@@ -1602,6 +2213,84 @@ h2 = hash(h1 + tokens_of_block_2)
 ```
 
 B 可以复用 A 的前两个完整 block，但必须为 `[10,11]` 所在的尾块分配自己的物理 block。
+
+### 13.9 BlockManager 的 Block 和 GPU KV Cache 不是同一个东西
+
+源码位置：[block_manager.py](nanovllm/engine/block_manager.py)，构造函数节选：
+
+```python
+self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+self.hash_to_block_id: dict[int, int] = dict()
+self.free_block_ids: deque[int] = deque(range(num_blocks))
+self.used_block_ids: set[int] = set()
+```
+
+它创建的是 CPU 上的块元数据和索引，并没有创建保存 K/V 的 GPU Tensor。实际 GPU 分配在 [model_runner.py](nanovllm/engine/model_runner.py) 的 `allocate_kv_cache()`。
+
+两边通过数字 ID 协作：BlockManager 选择物理块 7，Sequence 记录 `[7]`，Runner 计算 slot，Attention 向 GPU Tensor 对应位置写入数据。不是把 `Block` Python 对象传给 FlashAttention。
+
+### 13.10 分配函数的调用者、参数和返回结果
+
+调用者是 [scheduler.py](nanovllm/engine/scheduler.py) 的 `schedule()`。它先调用 `can_allocate(seq)` 查询，再调用 `allocate(seq, num_cached_blocks)` 执行。
+
+- `can_allocate()` 返回 `-1`：空间不足。
+- 返回 `0`：空间够，但没有可复用前缀。
+- 返回正整数：可复用多少个完整前缀块。
+
+这里不能写成 `if not can_allocate(seq)` 来判断失败，因为 **0 是一个合法成功结果**。
+
+源码位置：[block_manager.py](nanovllm/engine/block_manager.py)，`allocate()` 尾部：
+
+```python
+for i in range(num_cached_blocks, seq.num_blocks):
+    seq.block_table.append(self._allocate_block())
+seq.num_cached_tokens = num_cached_blocks * self.block_size
+```
+
+此前已把共享的缓存块 ID 追加进块表，这里为剩余逻辑块分配物理 ID，并把命中的 token 数写入 Sequence。`allocate()` 不返回 KV Tensor，结果通过修改 `seq.block_table` 和 `seq.num_cached_tokens` 体现。
+
+教学例子：prompt 长度 300，block size 256，第一个块命中，则 `num_cached_tokens=256`，本轮只需计算尾部 44 个 token。块表仍然需要两个 ID，因为历史缓存和新尾部都要有存放位置。
+
+### 13.11 用 can_allocate 的真实循环核对缓存粒度
+
+源码位置：同一文件的 `can_allocate()`，连续节选：
+
+```python
+for i in range(seq.num_blocks - 1):
+    token_ids = seq.block(i)
+    h = self.compute_hash(token_ids, h)
+    block_id = self.hash_to_block_id.get(h, -1)
+    if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+        break
+    num_cached_blocks += 1
+    if block_id in self.used_block_ids:
+        num_new_blocks -= 1
+```
+
+`range(seq.num_blocks - 1)` 是排除最后一个逻辑块的直接证据。比如一个恰好 256 token 的请求只有一个块，循环次数是 0，不会完全复用这个尾块；512 token 的请求最多复用前一个块。
+
+循环连续从头匹配，一旦某块不命中就 break，后面的块不继续尝试。因此这叫**前缀**缓存，不是寻找文本中任意相同片段。
+
+`used_block_ids` 中已被其他请求占用的命中块可以直接共享，不占新的 free ID；命中但当前在 free 队列中的旧块则需要重新占用这个 ID。两种命中都可能省计算，但资源计数不同。
+
+### 13.12 谁负责释放，释放以后数据去哪了？
+
+源码位置：同一文件的完整 `deallocate()`：
+
+```python
+def deallocate(self, seq: Sequence):
+    for block_id in reversed(seq.block_table):
+        block = self.blocks[block_id]
+        block.ref_count -= 1
+        if block.ref_count == 0:
+            self._deallocate_block(block_id)
+    seq.num_cached_tokens = 0
+    seq.block_table.clear()
+```
+
+它有两个主要调用场景：Scheduler 在请求完成时回收，以及在抢占时回收。共享块只减引用，不会在仍有活跃使用者时归还 free 队列。
+
+清空的是这条请求的映射，不是立刻销毁整个 `ModelRunner.kv_cache`。GPU 大 Tensor 在引擎生命周期内继续存在；不再被引用的块可以随后复用，旧完整块也可能继续作为前缀缓存命中。
 
 ---
 
@@ -1700,6 +2389,98 @@ prepare_prefill/decode
 
 只有 rank 0 创建 temperatures、执行采样并返回 token ID；其他 rank 只参与模型计算和通信。
 
+### 14.7 call('run', ...) 为什么能调用 run？
+
+源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，完整 `ModelRunner.call()`：
+
+```python
+def call(self, method_name, *args):
+    if self.world_size > 1 and self.rank == 0:
+        self.write_shm(method_name, *args)
+    method = getattr(self, method_name, None)
+    return method(*args)
+```
+
+当 `LLMEngine.step()` 传入字符串 `'run'` 时，`getattr(self, 'run', None)` 取得当前 Runner 的 `run` 方法，再用 `method(*args)` 执行它。这里的 `*args` 展开为 `seqs, is_prefill`。
+
+单卡时直接执行本地方法。多卡 rank 0 先广播控制消息，其他 rank 在 `loop()` 中取出同名指令并执行各自的模型分片。这不是远程 HTTP 调用，而是同机多进程控制。
+
+### 14.8 run 的完整源码：Sequence 在哪一步变成模型输入
+
+源码位置：同一文件的 `ModelRunner.run()`：
+
+```python
+def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+    logits = self.run_model(input_ids, positions, is_prefill)
+    token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+    reset_context()
+    return token_ids
+```
+
+1. 输入仍是 Python 的 Sequence 对象列表。
+2. `prepare_*()` 读取对象，打包为 GPU 上的整数 Tensor，同时设置 Context。
+3. `run_model()` 执行网络并计算 logits。完整 Sequence 不进入 Qwen3 forward。
+4. rank 0 的 Sampler 返回整数 Tensor；`.tolist()` 将结果转换为 CPU Python 整数列表，供 Scheduler 写回。
+5. 清空本次执行元数据，返回新 token IDs。非零 rank 返回 None，但它们不负责调用主调度器。
+
+这是“CPU 管理对象 → GPU Tensor → CPU 生成结果”的边界。
+
+### 14.9 拿两个请求手算 prepare_prefill 的打包边界
+
+假设 A 本轮输入 3 个 token，B 本轮输入 2 个 token，没有缓存前缀：
+
+```text
+input_ids       [10,20,30, 80,90]      总形状 [5]
+positions       [0, 1, 2,  0, 1]      每条序列位置重新从 0 开始
+cu_seqlens_q    [0, 3, 5]             A 在 [0:3]，B 在 [3:5]
+cu_seqlens_k    [0, 3, 5]             无历史缓存时与 Q 边界一致
+```
+
+连续节选，位于同一文件 `prepare_prefill()` 的循环内：
+
+```python
+cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+max_seqlen_q = max(seqlen_q, max_seqlen_q)
+max_seqlen_k = max(seqlen_k, max_seqlen_k)
+```
+
+`cu` 可以理解为 cumulative（累计）。A 结束累计 3，B 结束累计 5；FlashAttention 依靠边界知道两条请求不能互相 Attention。
+
+如果 A 已有 256 个缓存 token，本轮只输入新的 44 个，B 无缓存输入 2 个，则 Q 边界是 `[0,44,46]`，K 边界是 `[0,300,302]`。这不是在当前输入 Tensor 中额外塞入旧 K/V，而是通过 `block_tables` 读取历史缓存。
+
+### 14.10 Context 的生产者和消费者在哪里？
+
+| 动作 | 文件与函数 | 内容 |
+|---|---|---|
+| 创建本轮元数据 | [model_runner.py](nanovllm/engine/model_runner.py) 的 `prepare_prefill/decode()` | 调用 `set_context(...)` |
+| 保存元数据 | [context.py](nanovllm/utils/context.py) 的 `set_context()` | 更新当前进程的 `_CONTEXT` |
+| 读取缓存映射和模式 | [attention.py](nanovllm/layers/attention.py) 的 `Attention.forward()` | `context = get_context()` |
+| 读取 Prefill 尾位置 | [embed_head.py](nanovllm/layers/embed_head.py) 的 `ParallelLMHead.forward()` | 同样调用 `get_context()` |
+| 清空元数据 | `ModelRunner.run()` | 调用 `reset_context()` |
+
+它不是跨进程共享内存：每个 rank 的 Runner 都准备自己的 Context。它也不是第 2.11 节介绍的 `with` 上下文管理器，而是存放本轮执行参数的全局记录。
+
+### 14.11 KV Cache 怎样绑定到每层 Attention？
+
+源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`allocate_kv_cache()` 尾部：
+
+```python
+self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+layer_id = 0
+for module in self.model.modules():
+    if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+        module.k_cache = self.kv_cache[0, layer_id]
+        module.v_cache = self.kv_cache[1, layer_id]
+        layer_id += 1
+```
+
+`self.model.modules()` 遍历整个模型里的子模块，找到具有两个缓存字段的 Attention。每个模块得到该层的 Tensor 切片，通常共享底层存储，不是为每个请求再复制整个缓存。
+
+这也解释了初始化顺序：模型先创建空的 `k_cache/v_cache` 字段，预热后 Runner 分配总缓存，再把各层字段替换为正确切片。后续 `Attention.forward()` 才能向这些缓存写入 K/V。
+
 ---
 
 ## 15. Qwen3 模型结构
@@ -1779,6 +2560,73 @@ last_indices = context.cu_seqlens_q[1:] - 1
 
 因为只需要预测每条序列的下一个 token，不需要为 prompt 中每个位置都生成完整词表 logits。
 
+### 15.5 谁构造 Qwen3，谁执行它？
+
+源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`ModelRunner.__init__()` 节选：
+
+```python
+self.model = Qwen3ForCausalLM(hf_config)
+load_model(self.model, config.model)
+self.sampler = Sampler()
+```
+
+这里先创建模型结构，紧接着加载权重。`hf_config` 提供层数、隐藏维度、词表大小等，不包含全部训练后的参数值。
+
+执行入口在同一文件的 `run_model()`，正常执行分支是：
+
+```python
+return self.model.compute_logits(self.model(input_ids, positions))
+```
+
+从里向外看：先执行 `self.model(input_ids, positions)` 得到 hidden states，再执行 `compute_logits(...)` 得到词表分数。`self.model` 是一个 `nn.Module` 对象，对象调用会进入它的 `forward()`；不是再次运行构造函数。
+
+### 15.6 从 wrapper 一直进入每个 Decoder Layer
+
+源码位置：[qwen3.py](nanovllm/models/qwen3.py)，`Qwen3ForCausalLM.forward()` 的函数体：
+
+```python
+return self.model(input_ids, positions)
+```
+
+这里的 `self.model` 是内部的 `Qwen3Model`，与外层 Runner 的 `self.model` 名字相同、所属对象不同。看源码时必须先确认 `self` 指哪一个类。
+
+继续进入同一文件的 `Qwen3Model.forward()`，连续函数体：
+
+```python
+hidden_states = self.embed_tokens(input_ids)
+residual = None
+for layer in self.layers:
+    hidden_states, residual = layer(positions, hidden_states, residual)
+hidden_states, _ = self.norm(hidden_states, residual)
+return hidden_states
+```
+
+- 输入 `input_ids` 是一维整数 Tensor `[T]`，查表后变成浮点 Tensor `[T,H]`。
+- `self.layers` 是构造时建立的 `nn.ModuleList`，包含模型配置指定数量的 Decoder Layer。
+- 每个 Layer 返回两路结果：本层计算输出和累积残差。
+- 最后一次 Norm 合并最终残差，返回 hidden states；词表投影不在这个函数里。
+
+假设教学模型 `T=5,H=8`，则 embedding 后以及每一层结束后的 hidden states 形状都为 `[5,8]`。这是示意尺寸，不是声称 Qwen3-0.6B 的 hidden size 为 8。
+
+### 15.7 Decoder Layer 的真实顺序：残差为什么单独传？
+
+源码位置：同一文件 `Qwen3DecoderLayer.forward()` 的函数体：
+
+```python
+if residual is None:
+    hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+else:
+    hidden_states, residual = self.input_layernorm(hidden_states, residual)
+hidden_states = self.self_attn(positions, hidden_states)
+hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+hidden_states = self.mlp(hidden_states)
+return hidden_states, residual
+```
+
+第一次进入时 residual 为空，保存原输入，同时归一化。后续层进入时，先将上一层的 MLP 输出与 residual 相加，再一起归一化。Attention 后的 Norm 也执行“相加 + 归一化”，最后 MLP 的残差加法延迟到下一层的入口，或最后的 `self.norm`。
+
+所以只看 `hidden_states = self.mlp(...)` 后面没有显式 `+ residual`，不能断言模型漏了残差。必须跟踪函数返回的第二个对象，并继续看下一层和最终 Norm。
+
 ---
 
 ## 16. Attention、RoPE、RMSNorm、SwiGLU
@@ -1808,7 +2656,7 @@ RMSNorm 简化公式：
 y = x / sqrt(mean(x²) + eps) × weight
 ```
 
-与 LayerNorm 相比，它不减均值。源码先转为 FP32 计算方差，再转回原 dtype，提高数值稳定性。
+与 LayerNorm 相比，它不减均值。源码先转为 FP32 计算平方均值，再转回原 dtype，提高数值稳定性。
 
 `add_rms_forward` 同时完成：
 
@@ -1844,6 +2692,124 @@ flash_attn_with_kvcache(..., cache_seqlens=..., block_table=...)
 ```
 
 `causal=True` 保证当前位置不能偷看未来 token。
+
+### 16.6 Attention：构造位置与实际调用顺序
+
+定义与构造都在 [qwen3.py](nanovllm/models/qwen3.py) 的 `Qwen3Attention` 中；它持有投影层、RoPE、内部 `Attention` 模块。其 `forward()` 连续节选：
+
+```python
+qkv = self.qkv_proj(hidden_states)
+q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+q = q.view(-1, self.num_heads, self.head_dim)
+k = k.view(-1, self.num_kv_heads, self.head_dim)
+v = v.view(-1, self.num_kv_heads, self.head_dim)
+if not self.qkv_bias:
+    q = self.q_norm(q)
+    k = self.k_norm(k)
+q, k = self.rotary_emb(positions, q, k)
+o = self.attn(q, k, v)
+output = self.o_proj(o.flatten(1, -1))
+return output
+```
+
+按数据流看：
+
+1. `[T,H]` 一次投影成合并 QKV。
+2. `split` 按不同宽度拆开，Q 和 KV 宽度可能不同，因为 Q heads 可以更多。
+3. `view` 拆出 head 维；`-1` 这里恢复本轮 token 数 T。
+4. 按配置对 Q/K 做 Norm，不对 V 做这个 Norm。
+5. `rotary_emb` 给 Q/K 加入位置信息，不修改 V。
+6. `self.attn` 进入 [attention.py](nanovllm/layers/attention.py) 的 `Attention.forward()`，完成写缓存和注意力计算。
+7. 合并 head 维，再经过 `o_proj` 返回 `[T,H]`。
+
+`Qwen3Attention` 和 `Attention` 不是同一个类：前者包括 QKV 投影、位置编码和输出投影，后者负责底层缓存与 FlashAttention。
+
+### 16.7 写入缓存和读取缓存，分别在哪一行发生？
+
+源码位置：[attention.py](nanovllm/layers/attention.py)，`Attention.forward()` 开头：
+
+```python
+context = get_context()
+k_cache, v_cache = self.k_cache, self.v_cache
+if k_cache.numel() and v_cache.numel():
+    store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+```
+
+这是**写入本轮新 K/V**。后面的两个 FlashAttention 分支是**读取当前可见上下文并计算输出**：
+
+- Prefill 没有历史前缀时，直接使用本轮算出的 K/V。
+- Prefill 已有前缀/早前 chunk 时，`context.block_tables is not None`，改用分页缓存作为 K/V 来源。
+- Decode 使用 `flash_attn_with_kvcache` 读取历史 KV；本轮 token 的 KV 在调用它之前已写入缓存。
+
+预热阶段缓存还是空 Tensor，因此跳过 store；这并不妨碍用本轮 Q/K/V 做 Prefill 计算。
+
+源码位置：同一文件 `store_kvcache_kernel()` 的连续节选：
+
+```python
+idx = tl.program_id(0)
+slot = tl.load(slot_mapping_ptr + idx)
+if slot == -1: return
+key_offsets = idx * key_stride + tl.arange(0, D)
+value_offsets = idx * value_stride + tl.arange(0, D)
+key = tl.load(key_ptr + key_offsets)
+value = tl.load(value_ptr + value_offsets)
+cache_offsets = slot * D + tl.arange(0, D)
+tl.store(k_cache_ptr + cache_offsets, key)
+tl.store(v_cache_ptr + cache_offsets, value)
+```
+
+`idx` 表示本轮第几个输入 token，`slot` 表示它在缓存中的物理位置，`D=num_kv_heads*head_dim` 表示这个 token 的 K 或 V 有多少个元素。它复制的是向量，不是一个 token ID。
+
+例如物理块 7、块内位置 3，slot 是 `7*256+3`；再乘 D 才得到该向量在当前层缓存存储中的元素偏移。`slot==-1` 的跳过分支用于无效位置，例如 CUDA Graph 的 padding。
+
+### 16.8 RoPE 和 RMSNorm：把公式落到实际代码上
+
+源码位置：[rotary_embedding.py](nanovllm/layers/rotary_embedding.py)，`apply_rotary_emb()` 函数体：
+
+```python
+x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+y1 = x1 * cos - x2 * sin
+y2 = x2 * cos + x1 * sin
+return torch.cat((y1, y2), dim=-1).to(x.dtype)
+```
+
+它沿 head 的最后一维分成两半，配对旋转，再拼回原宽度。角度表来自 `RotaryEmbedding.forward()` 中的 `self.cos_sin_cache[positions]`。其上游调用者就是 `Qwen3Attention.forward()` 的 `self.rotary_emb(...)`。
+
+源码位置：[layernorm.py](nanovllm/layers/layernorm.py)，`RMSNorm.rms_forward()` 函数体：
+
+```python
+orig_dtype = x.dtype
+x = x.float()
+var = x.pow(2).mean(dim=-1, keepdim=True)
+x.mul_(torch.rsqrt(var + self.eps))
+x = x.to(orig_dtype).mul_(self.weight)
+return x
+```
+
+变量虽然叫 `var`，这里计算的是平方均值，不是减去均值后的统计方差。`keepdim=True` 保留最后一维以便广播；`rsqrt` 是 `1/sqrt(...)`；带下划线的 `mul_` 表示原地乘法。最后乘的是训练得到的缩放权重，而不是固定常数。
+
+`RMSNorm.forward()` 根据是否传入 residual，选择 `rms_forward()` 或 `add_rms_forward()`。第 15.7 节中传两个参数的 Norm 调用，就是选择融合残差路径的原因。
+
+### 16.9 MLP 中谁调用 SiluAndMul？
+
+源码位置：[qwen3.py](nanovllm/models/qwen3.py)，完整 `Qwen3MLP.forward()`：
+
+```python
+def forward(self, x):
+    gate_up = self.gate_up_proj(x)
+    x = self.act_fn(gate_up)
+    x = self.down_proj(x)
+    return x
+```
+
+`self.act_fn` 在该类构造函数中创建为 `SiluAndMul()`，所以第二行进入 [activation.py](nanovllm/layers/activation.py)：
+
+```python
+x, y = x.chunk(2, -1)
+return F.silu(x) * y
+```
+
+单卡教学形状：输入 `[T,H]` → 合并投影 `[T,2I]` → 切成两个 `[T,I]` → 激活相乘 `[T,I]` → down 投影 `[T,H]`。I 是模型的 intermediate size，多卡时每张卡的中间维会按 TP 切分。
 
 ---
 
@@ -1893,6 +2859,53 @@ temperature > 1e-10
 ```
 
 所以 `temperature=0` 会报错。把温度设成非常小也不是严谨的 greedy API，还可能产生极端 logits。若要扩展 greedy，应在 Sampler 中显式增加 `argmax(logits)` 分支，而不是绕过断言。
+
+### 17.5 从每个输入 token 的 hidden state，到每个请求一个 token
+
+源码位置：[embed_head.py](nanovllm/layers/embed_head.py)，`ParallelLMHead.forward()` 开头：
+
+```python
+context = get_context()
+if context.is_prefill:
+    last_indices = context.cu_seqlens_q[1:] - 1
+    x = x[last_indices].contiguous()
+logits = F.linear(x, self.weight)
+```
+
+教学例子：Prefill 输入是 A 的 3 个 token 和 B 的 2 个 token，hidden states 形状 `[5,H]`，`cu_seqlens_q=[0,3,5]`。
+
+```text
+last_indices = [3,5] - 1 = [2,4]
+选择 x[2] 和 x[4] -> [2,H]
+投影到词表         -> [2,V]
+采样               -> [2]
+```
+
+所以模型虽然处理了 5 个 token，本轮只为 2 条请求各采样一个输出，不会生成 5 个 completion token。Decode 每条请求只有一个输入，本身已经是 `[B,H]`，不需要这次筛选。
+
+### 17.6 Sampler 的创建、调用及逐行解释
+
+创建点在 `ModelRunner.__init__()` 的 `self.sampler = Sampler()`。调用点在 `ModelRunner.run()` 的 `self.sampler(logits, temperatures)`，通过 `nn.Module.__call__` 进入下面的方法。
+
+源码位置：[sampler.py](nanovllm/layers/sampler.py)，完整 `Sampler.forward()`：
+
+```python
+@torch.compile
+def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
+    logits = logits.float().div_(temperatures.unsqueeze(dim=1))
+    probs = torch.softmax(logits, dim=-1)
+    sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
+    return sample_tokens
+```
+
+- `logits` 形状 `[B,V]`，temperatures 形状 `[B]`。
+- `unsqueeze(1)` 把温度变成 `[B,1]`，广播到这一请求的 V 个候选分数；不同请求可以使用不同温度。
+- `.float()` 用 FP32 进行概率相关计算；`softmax(dim=-1)` 沿词表维归一化。
+- `.exponential_(1)` 为每个候选生成指数随机数，`clamp_min_` 避免极小分母。
+- 最后的 `argmax` 选择的是“概率除以随机数”的最大值，**不是直接取原 logits 最大值**，因此仍然是随机采样。
+- 返回 `[B]` 整数 Tensor，Runner 转成列表，Scheduler 按批次顺序写回各 Sequence。
+
+完整回路是：`seq.temperature` → `prepare_sample()` → Sampler → token ID → `Scheduler.postprocess()` → `Sequence.append_token()`。生成结果不是 Sampler 直接输出中文字符串。
 
 ---
 
@@ -1945,6 +2958,58 @@ model.layers.0.self_attn.qkv_proj.weight
 - Packed QKV/Gate-Up：先定位合并区间，再取 TP 分片。
 
 这让 checkpoint 保持 Hugging Face 原格式，无需提前离线转换为每卡权重。
+
+### 18.3 调用链：加载动作发生在第一次 generate 之前
+
+```text
+LLMEngine.__init__
+  -> ModelRunner.__init__
+      -> Qwen3ForCausalLM(hf_config)       建立参数容器
+      -> load_model(model, config.model)  把文件里的训练参数写进容器
+      -> warmup_model()                  使用已加载的权重计算
+```
+
+`nn.Parameter(torch.empty(...))` 只是分配存储，不是初始化成训练好的模型。不加载权重就运行，不能得到有意义的结果。
+
+源码位置：[loader.py](nanovllm/utils/loader.py)，`load_model()` 中处理合并权重的连续节选：
+
+```python
+v, shard_id = packed_modules_mapping[k]
+param_name = weight_name.replace(k, v)
+param = model.get_parameter(param_name)
+weight_loader = getattr(param, "weight_loader")
+weight_loader(param, f.get_tensor(weight_name), shard_id)
+```
+
+假设文件键名是 `model.layers.0.self_attn.q_proj.weight`：
+
+1. 在 Qwen3 的映射表中找到 `q_proj -> ('qkv_proj', 'q')`。
+2. 把名字改成运行时存在的 `...qkv_proj.weight`。
+3. `get_parameter()` 找到已经构造好的目标参数对象。
+4. 取这个参数自己的加载函数。
+5. 读取文件中的 Q 权重，并带上 `'q'`，告诉加载函数写入合并参数的 Q 区间。
+
+不是把三个权重随意按文件遍历顺序拼接；目标位置由 shard_id 和模型结构决定。
+
+### 18.4 weight_loader 为什么能挂在一个 Parameter 上？
+
+源码位置：[linear.py](nanovllm/layers/linear.py)，`LinearBase.__init__()` 中：
+
+```python
+self.weight = nn.Parameter(torch.empty(output_size, input_size))
+self.weight.weight_loader = self.weight_loader
+```
+
+这里把当前层的加载方法作为额外属性挂到 Parameter 对象上。loader 拿到参数以后，可以用统一方式调用各类层自己的切片规则，而无需在一个函数里写很多 `if isinstance(layer, ...)`。
+
+普通没有自定义 loader 的参数走 [loader.py](nanovllm/utils/loader.py) 的默认函数：
+
+```python
+def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
+    param.data.copy_(loaded_weight)
+```
+
+`copy_` 是将读取的数值复制进现有参数存储，不是重新创建一个同名模型层。这个过程发生在推理前，不是训练时的反向传播或优化器更新。
 
 ---
 
@@ -2005,13 +3070,70 @@ LM Head 每张卡只算一段词表 logits，最后 `gather` 到 rank 0 并拼�
 - 共享内存固定为 1 MiB，极大控制消息可能超过容量；
 - 多个 nano-vllm 实例同时运行可能发生固定端口或共享内存名称冲突。
 
+### 19.6 启动其他 rank 的源码在哪里？
+
+源码位置：[llm_engine.py](nanovllm/engine/llm_engine.py)，`LLMEngine.__init__()`：
+
+```python
+ctx = mp.get_context("spawn")
+for i in range(1, config.tensor_parallel_size):
+    event = ctx.Event()
+    process = ctx.Process(target=ModelRunner, args=(config, i, event))
+    process.start()
+    self.ps.append(process)
+    self.events.append(event)
+self.model_runner = ModelRunner(config, 0, self.events)
+```
+
+`tensor_parallel_size=1` 时 range 为空，不创建子进程；rank 0 仍构造 ModelRunner，并初始化大小为 1 的 NCCL 进程组。多卡时，rank 1…N-1 分别在子进程里构造 Runner，rank 0 在当前进程构造。
+
+`spawn` 会启动新解释器并导入代码，所以示例入口的 `if __name__ == '__main__': main()` 很重要，避免子进程导入时重复执行启动逻辑。
+
+### 19.7 分片和通信：拿一个小矩阵手算
+
+PyTorch Linear 权重存储为 `[out,in]`。假设一个输入向量有 4 维、输出也有 4 维，用两卡演示：
+
+- Column Parallel：每卡存 2 行完整权重 `[2,4]`，都接收相同的 4 维输入，分别得到 2 维输出。逻辑上是完整结果的不同片段。
+- Row Parallel：每卡存权重的一半输入维 `[4,2]`，各接收对应的 2 维输入，分别得到 4 维“部分贡献”，相加才是完整结果。
+
+源码位置：[linear.py](nanovllm/layers/linear.py)，完整 `RowParallelLinear.forward()`：
+
+```python
+def forward(self, x: torch.Tensor) -> torch.Tensor:
+    y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+    if self.tp_size > 1:
+        dist.all_reduce(y)
+    return y
+```
+
+`all_reduce` 默认求和，把各卡部分贡献加起来。bias 若存在只在 rank 0 加一次，否则每卡都加再求和会把 bias 重复 N 次。
+
+本项目里 `qkv_proj/gate_up_proj` 用输出切分，`o_proj/down_proj` 用输入切分和 all-reduce，所以多卡不只是“每张卡独立生成不同请求”。每张卡都参与同一个批次的每一层计算。
+
+### 19.8 控制消息和模型 Tensor 为什么走两条通道？
+
+源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`write_shm()` 的连续节选：
+
+```python
+data = pickle.dumps([method_name, *args])
+n = len(data)
+self.shm.buf[0:4] = n.to_bytes(4, "little")
+self.shm.buf[4:n+4] = data
+for event in self.event:
+    event.set()
+```
+
+共享内存存的是“执行哪个方法、有哪些 Sequence 元数据”，Event 通知工作进程来读。权重和大规模 hidden states 不靠这个 1 MiB Python 消息反复传输；GPU 层的部分结果使用 NCCL 的 all-reduce/gather 合并。
+
+读消息后，非零 rank 用自身模型权重分片计算；LM Head gather 到 rank 0，rank 0 才有完整词表 logits 并采样。这也解释了第 11 章中非零 rank 的 Sequence 快照可以省略调度和采样字段。
+
 ---
 
 ## 20. CUDA Graph 与 torch.compile
 
 ### 20.1 `enforce_eager=True` 是什么
 
-这里的 eager 指每轮正常发起 PyTorch/CUDA 运算。设置为 `True`：
+这里的 eager 主要指关闭 Runner 的 Decode CUDA Graph 路径。设置为 `True`：
 
 - 启动更简单；
 - 更容易调试；
@@ -2019,6 +3141,8 @@ LM Head 每张卡只算一段词表 logits，最后 `gather` 到 rank 0 并拼�
 - 性能可能较低。
 
 初次运行和源码调试建议使用 `True`。
+
+但它**不会自动移除各层的 `@torch.compile` 装饰器**。因此 `enforce_eager=True` 时首次调用仍可能编译 Norm、RoPE、激活或采样函数，不应理解成“所有计算都完全不编译”。
 
 ### 20.2 CUDA Graph 解决什么
 
@@ -2030,7 +3154,7 @@ Decode 每轮计算量不大，却要重复发起许多相同形状的 CUDA kern
 1, 2, 4, 8, 16, 32, 48, ...，直到 max_num_seqs 或 512
 ```
 
-实际 batch size 若为 13，会选择不小于它的最小已捕获尺寸 16，并对剩余位置使用 padding/无效 slot。
+在默认配置的图集合中，实际 batch size 若为 13，会选择不小于它的最小已捕获尺寸 16，并对剩余位置使用 padding/无效 slot。自定义较小 `max_num_seqs` 时要检查图集合，见第 20.7 节。
 
 Prefill 形状变化大，仍走 eager；Decode batch 超过 512 也走 eager。
 
@@ -2048,9 +3172,72 @@ Prefill 形状变化大，仍走 eager；Decode batch 超过 512 也走 eager。
 
 捕获的是 `self.model(...)`，也就是 embedding、Transformer layers 和 final norm。LM Head 的 `compute_logits(...)` 在 graph replay 之后执行，不包含在捕获图中。
 
+### 20.5 哪个分支选择 eager，哪个分支选择 replay？
+
+源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`run_model()` 开头：
+
+```python
+if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    return self.model.compute_logits(self.model(input_ids, positions))
+else:
+    bs = input_ids.size(0)
+    context = get_context()
+    graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+```
+
+满足三个条件之一就走正常模型调用。否则是小批次 Decode，选择第一个容量不小于真实 batch 的已捕获图。默认捕获集合包含 16 时，实际 batch 13 会选择 16，后面只取前 13 条真实输出。
+
+这是调用选择，不是“模型权重被换成另一个模型”。两种路径使用的是同一个 Qwen3 实例及其参数。
+
+### 20.6 为什么不能每轮创建新输入，然后直接 replay？
+
+同一方法中，更新固定缓冲区的连续源码：
+
+```python
+graph_vars["input_ids"][:bs] = input_ids
+graph_vars["positions"][:bs] = positions
+graph_vars["slot_mapping"].fill_(-1)
+graph_vars["slot_mapping"][:bs] = context.slot_mapping
+graph_vars["context_lens"].zero_()
+graph_vars["context_lens"][:bs] = context.context_lens
+graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+graph.replay()
+return self.model.compute_logits(graph_vars["outputs"][:bs])
+```
+
+捕获图使用的 Tensor 存储地址需要保持稳定，所以先把本轮数据复制进固定缓冲区，再 replay。不是将某个 Python 变量重新绑定到新 Tensor，图就会自动跟随它。
+
+`slot_mapping` 先填 `-1`，让 padding 位置不写缓存；`context_lens` 清零，让 padding 没有有效上下文。计算结束后按真实 bs 截取 hidden states，再在图外计算 LM Head。
+
+### 20.7 捕获发生在初始化，重放发生在生成循环
+
+源码位置：同一文件 `capture_cudagraph()` 中：
+
+```python
+outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+with torch.cuda.graph(graph, self.graph_pool):
+    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+```
+
+初始化时，对多个 bs 分别预热并捕获。以后每个 Decode step 在 `run_model()` 里重放合适的图。不要在 `generate()` 每轮重新 capture，否则无法获得复用意义。
+
+当前 `graph_bs` 的构造是 `[1,2,4,8] + list(range(16, max_bs+1, 16))`。它不是覆盖任意自定义 `max_num_seqs` 的完善算法：例如设成 13，没有 16 的图，实际批次大于 8 时可能找不到合适项；设得小于 8 也存在固定尺寸与缓冲区容量不匹配的风险。入门先使用 `enforce_eager=True`，研究图路径时再核对捕获集合与缓冲区形状，不要把默认示例推广成任意配置都安全。
+
 ---
 
 ## 21. 一次请求的完整时序复盘
+
+本章把前面各模块串成一次真实调用路径。请一边看以下步骤，一边在对应文件中搜索方法名：
+
+| 步骤 | 实际执行位置 |
+|---|---|
+| 创建请求 | [llm_engine.py](nanovllm/engine/llm_engine.py) 的 `add_request()` → [sequence.py](nanovllm/engine/sequence.py) 的 `__init__()` |
+| 调度并分配块 | [scheduler.py](nanovllm/engine/scheduler.py) 的 `schedule()` → [block_manager.py](nanovllm/engine/block_manager.py) 的 `allocate()` |
+| 打包 Prefill | [model_runner.py](nanovllm/engine/model_runner.py) 的 `run()` → `prepare_prefill()` |
+| 网络前向、写入 KV | `run_model()` → [qwen3.py](nanovllm/models/qwen3.py) 的模型层 → [attention.py](nanovllm/layers/attention.py) |
+| 采样并写回请求 | [sampler.py](nanovllm/layers/sampler.py) → `Scheduler.postprocess()` → `Sequence.append_token()` |
+| 下一轮 Decode | `schedule()` → `prepare_decode()` → 网络前向 |
+| 完成和返回文字 | `postprocess()` → `deallocate()` → `LLMEngine.step()` → `generate()` 解码 |
 
 假设：
 
@@ -2131,6 +3318,41 @@ status = FINISHED
 
 BlockManager 释放请求对 block 7 的引用。`generate()` 按 `seq_id` 恢复原输入顺序，解码 `[40,50]` 并返回。
 
+注意这是“在 postprocess 内刚达到结束条件”的观察；方法返回时已执行回收，`num_cached_tokens=0`、`block_table=[]`，而 `[40,50]` 仍保留在 token 列表中。
+
+### 21.1 同样的请求，怎样在源码中一步步看到它？
+
+把 `example.py` 的请求暂时缩减到一个，`max_tokens=2`，保持 `enforce_eager=True` 和单卡。以下是**学习时可自行做的调试实验，不是本次修改引擎源码**。
+
+1. 在 `add_request()` 的 `seq = Sequence(...)` 下一行断点，观察编码后的 prompt 和 seq 初始字段。
+2. 在 `LLMEngine.step()` 的 `schedule()` 返回后断点，观察本轮 `seqs`、`is_prefill`、块表与计划数。
+3. 进入 `prepare_prefill()`，观察 `start/end/input_ids/positions`，确认本轮处理哪段 token。
+4. 在 `postprocess()` 的 `seq.append_token(token_id)` 后断点，观察 `num_tokens` 比 `num_cached_tokens` 多一个。
+5. 下一轮进入 `prepare_decode()`，确认输入来自上轮的 `seq.last_token`。
+6. 在 `postprocess()` 回收之后观察 FINISHED 与空块表；回到 `step()` 看输出只包含 completion。
+7. 最后在 `generate()` 返回前观察字典列表，再回到 `example.main()` 的 `output['text']`。
+
+实际 tokenizer 长度和采样 token 不保证是手算中的 `[10,20,30,40,50]`；应该比较字段之间的关系，而不是要求真实数字完全相同。
+
+### 21.2 数据类型在调用链上怎样变化
+
+```text
+用户问题                         str
+聊天模板后的 prompt              str（含角色标记）
+tokenizer.encode                 list[int]
+Sequence                        CPU 上的请求状态对象
+prepare_prefill/decode           GPU 上的 input_ids/positions Tensor
+Qwen3 forward                   浮点 hidden states Tensor
+LM Head                         浮点 logits Tensor
+Sampler                         整数 token IDs Tensor
+Runner 的 .tolist()             list[int]
+Sequence.completion_token_ids   list[int]
+tokenizer.decode                str
+generate 的返回值                list[dict]，每条包含 text/token_ids
+```
+
+“对象状态”和“模型数值计算”在这里有明确边界。调试时先确认所在步骤的数据类型，再判断是不是传错了内容。
+
 ---
 
 ## 22. Benchmark 怎么读、怎么测
@@ -2176,6 +3398,25 @@ throughput = 所有请求实际要求的输出 token 总数 / 总生成秒数
 ### 22.4 注意随机 token 合法范围
 
 脚本用 `0..10000`，对 Qwen3 词表是有效子范围。换成词表更小的模型时可能越界。不过本项目本身也只实现了 Qwen3，不能只改模型路径就假定兼容其他架构。
+
+### 22.5 对照 bench.py：计时到底包住了哪一段？
+
+源码位置：[bench.py](bench.py)，`main()` 的连续节选：
+
+```python
+llm.generate(["Benchmark: "], SamplingParams())
+t = time.time()
+llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+t = (time.time() - t)
+total_tokens = sum(sp.max_tokens for sp in sampling_params)
+throughput = total_tokens / t
+```
+
+构造 LLM、加载权重、引擎自身预热和第一次 generate 都在计时前。计时包括第二次 generate 内的调度、前向、采样、写回及末尾解码，并不是只测某一个 CUDA kernel。
+
+每个请求设置 `ignore_eos=True`，所以用 `sum(sp.max_tokens)` 计算计划生成总量；若修改为遇到 EOS 就停，就不能继续把计划最大长度当成实际生成量。
+
+引擎进度条中的 Prefill/Decode 是按对应 step 更新的速率估计，`bench.py` 的 Throughput 是整次调用的输出 token 总量除以耗时，两者口径不同。不要直接把它们当成同一个性能指标。
 
 ---
 
@@ -2261,6 +3502,71 @@ Sampler：             logits.shape、采样 token
 
 不要在 `torch.compile` 函数、CUDA Graph 捕获区域或 Triton kernel 中随意加 Python `print`。调试时先使用 `enforce_eager=True`。
 
+### 23.7 建议设置的源码断点及应该看到的内容
+
+先使用单卡、一个短 prompt、很小的 `max_tokens`；确认 VS Code 使用 WSL 中的 venv，再用 Python 调试器启动 `example.py`。
+
+| 断点位置 | 建议停在哪条语句之后 | 重点观察 |
+|---|---|---|
+| `LLMEngine.add_request()` | `seq = Sequence(...)` | prompt 已变成整数，status=WAITING |
+| `LLMEngine.step()` | `seqs, is_prefill = ...` | 本轮选中的列表，不是全部队列 |
+| `Scheduler.schedule()` | 写 `num_scheduled_tokens` | 本轮预算如何扣减 |
+| `BlockManager.allocate()` | 写 `seq.num_cached_tokens` | 命中数量、物理块表、引用计数 |
+| `prepare_prefill()` | `return input_ids, positions` 前 | Tensor 形状和 Context 边界 |
+| `prepare_decode()` | `return input_ids, positions` 前 | 每条请求一个输入 token |
+| `Scheduler.postprocess()` | `seq.append_token(token_id)` 后 | 总长度比缓存长度多一个 |
+| `LLMEngine.generate()` | 最终 `return outputs` 前 | 字典列表已恢复提交顺序 |
+
+函数中的“当前行”通常表示**下一条将执行的语句**。如果停在赋值这一行，赋值可能尚未发生；要观察结果，应单步执行后再看变量。
+
+观察 GPU Tensor 时，优先查看 `.shape/.dtype/.device`。将大型 Tensor 转成 `.tolist()` 或打印全部内容会产生额外传输与同步，调试时的耗时不应当作真实 benchmark。
+
+### 23.8 不运行 GPU，也能模拟调度与 Sequence 的协作
+
+下面是完整教学脚本，用两个假设 token 代替 GPU/Sampler 返回值。它只验证 CPU 管理逻辑，**不验证模型计算、FlashAttention 或 CUDA 是否正常**。仍需先装好项目依赖，因为包导入会加载相关模块。
+
+```python
+from types import SimpleNamespace
+
+from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.sequence import Sequence
+from nanovllm.sampling_params import SamplingParams
+
+config = SimpleNamespace(
+    max_num_seqs=4,
+    max_num_batched_tokens=256,
+    eos=9999,
+    kvcache_block_size=256,
+    num_kvcache_blocks=8,
+)
+seq = Sequence([10, 20, 30], SamplingParams(max_tokens=2))
+scheduler = Scheduler(config)
+scheduler.add(seq)
+
+for fake_token in [40, 50]:
+    seqs, is_prefill = scheduler.schedule()
+    print("计划:", is_prefill, seq.num_scheduled_tokens, seq.block_table)
+    scheduler.postprocess(seqs, [fake_token], is_prefill)
+    print("结果:", seq.status.name, seq.token_ids, seq.num_cached_tokens)
+
+assert scheduler.is_finished()
+assert seq.completion_token_ids == [40, 50]
+assert seq.block_table == []
+print("完成:", seq.completion_token_ids)
+```
+
+独立执行且默认 block size 为 256 时，预期输出：
+
+```text
+计划: True 3 [0]
+结果: RUNNING [10, 20, 30, 40] 3
+计划: False 1 [0]
+结果: FINISHED [10, 20, 30, 40, 50] 0
+完成: [40, 50]
+```
+
+这里用 SimpleNamespace 提供 Scheduler 所需字段，避免真实 Config 去读取模型目录。这是教学替身，不是生产配置推荐。它没有改变项目源文件。
+
 ---
 
 ## 24. 常见报错与排查
@@ -2301,6 +3607,51 @@ nvidia-smi
 -> benchmark
 ```
 
+### 24.2 编辑器黄线：先读提示文字，不要一律重装包
+
+| 提示 | 说明 | 首先做什么 |
+|---|---|---|
+| `Import block is un-sorted or un-formatted` | 导入排序/分组不符合 Ruff 的规则 | 光标放到提示处，`Ctrl + .` 选择 Organize imports |
+| `Import could not be resolved` / 无法解析导入 | 检查器选用的环境里找不到模块，或配置不正确 | 核对 WSL 窗口与 Python 解释器路径 |
+| `imported but unused` | 导入后没有使用 | 确认是否确实需要该名字 |
+
+例如 [config.py](nanovllm/config.py) 的导入应把标准库与第三方库分开：
+
+```python
+import os
+from dataclasses import dataclass
+
+from transformers import AutoConfig
+```
+
+第一条警告可能给整个 import 块都画黄线，不代表 `os/dataclasses/transformers` 三个模块都缺失。`os` 和 `dataclasses` 本身就是 Python 标准库。[Ruff I001 官方规则](https://docs.astral.sh/ruff/rules/unsorted-imports/)
+
+### 24.3 pip show 能看到包，为什么 import 仍然失败？
+
+`pip show` 表示安装元数据存在；不保证实际导入及所有传递依赖都兼容。排查命令应明确使用正在运行项目的解释器：
+
+```bash
+source venv/bin/activate
+python -c "import sys; print(sys.executable)"
+python -m pip check
+python -c "import transformers; print(transformers.__version__)"
+```
+
+若错误明确说 Transformers 4.57.6 要求 `huggingface-hub>=0.34,<1.0`，但安装了 hub 2.x，就按该版本要求修复，而不是反复在 Windows 或另一个 venv 中安装：
+
+```bash
+python -m pip install "huggingface-hub>=0.34,<1.0"
+python -m pip check
+```
+
+如果以后换成别的 Transformers 版本，重新核对它的依赖要求，不要把这一条范围当成所有版本的永久规则。
+
+### 24.4 编译 warning 与请求失败怎么区分
+
+例如 Triton launcher 编译时打印 `_POSIX_C_SOURCE redefined` 的 `warning`，随后仍显示 `Generating: 100%` 并返回 Completion，说明该警告没有阻止这次推理。不要仅根据黄色文本就断定运行失败。
+
+真正需要检查的是：有没有异常 traceback、进程是否错误退出、请求是否完成，以及返回内容是否被 `max_tokens` 截断。达到长度上限属于正常结束条件，不会自动产生异常。
+
 ---
 
 ## 25. 当前实现的边界与容易忽略的行为
@@ -2326,9 +3677,29 @@ nvidia-smi
 17. **接口返回标注不准确。** `generate` 标为 `list[str]`，实现返回 `list[dict]`。
 18. **没有随机种子 API。** 结果默认带随机性；需要复现实验时要在适当进程/GPU 上管理 RNG 状态。
 
+### 25.1 把这些边界对应到真正的源码
+
+| 容易忽略的行为 | 可以核对的代码 |
+|---|---|
+| 参数名字拼错被忽略 | `LLMEngine.__init__()` 的 `if k in config_fields` |
+| prompt/参数列表不等长时少提交请求 | `LLMEngine.generate()` 的 `zip(prompts, sampling_params)` |
+| EOS 也被保存到 completion | `Scheduler.postprocess()` 先 `append_token()`，再检查 EOS |
+| chunk 非最后一段采样被丢弃 | 同一方法的 `if is_prefill ...: continue` |
+| 抢占需要重新计算 | `Scheduler.preempt()` 调 `deallocate()`，但保留 token_ids |
+| 最后逻辑块不参与前缀查询 | `BlockManager.can_allocate()` 的 `range(seq.num_blocks - 1)` |
+| `max_model_len` 不是入口强制校验 | `Config.__post_init__()` 只裁剪配置；`add_request()` 没有检查请求总长度 |
+| FINISHED 后缓存计数归零 | `BlockManager.deallocate()` 的最后两行 |
+| 自定义小 batch 上限可能不适配图集合 | `ModelRunner.capture_cudagraph()` 的固定 `[1,2,4,8]` 和 16 步长 |
+
+上表中的引擎函数位于 [llm_engine.py](nanovllm/engine/llm_engine.py)，其余对应 [scheduler.py](nanovllm/engine/scheduler.py)、[block_manager.py](nanovllm/engine/block_manager.py)、[config.py](nanovllm/config.py) 和 [model_runner.py](nanovllm/engine/model_runner.py)。
+
+当前生成长度判定用 `num_completion_tokens == max_tokens`，且没有校验 `max_tokens` 必须为正。入门实验传正整数，不要把 `max_tokens=0` 当作“自动不生成”；扩展 API 时应先补明确的参数校验。
+
 ---
 
 ## 26. 从简单到进阶的练习
+
+本章使用 `tokenizer` 或 `llm` 的练习，都假设你已经按第 6 章创建好这两个对象。第 11.9、23.8 节则是可独立运行的 CPU 管理实验，不需要创建 LLM。不要把依赖前文变量的局部片段直接当成完整脚本。
 
 ### 练习 1：观察 tokenizer
 
@@ -2431,6 +3802,21 @@ for update in llm.stream_generate(...):
 ```
 
 这项练习能帮助你区分“算法原型”和“生产系统”。
+
+### 练习对应的源码与验收标准
+
+| 练习 | 对照源码 | 怎样判断理解了 |
+|---|---|---|
+| 1、3：tokenizer 与直接 token 输入 | `LLMEngine.add_request()` | 能解释文字分支 encode，整数列表分支不 encode |
+| 2：温度 | `prepare_sample()`、`Sampler.forward()` | 能追踪每条请求温度到 `[B,1]` 广播，不把低温等同于 greedy |
+| 4：请求状态 | `Sequence`、`Scheduler.postprocess()` | 能重现第 11.8 节关系，并解释结束后缓存清零 |
+| 5：前缀复用 | `can_allocate()/hash_blocks()/allocate()` | 共享完整前缀块 ID，理解最后逻辑块排除规则 |
+| 6：chunked prefill | `Scheduler.schedule()/postprocess()` | 记录多轮预算，非最后 chunk 不追加 completion |
+| 7：缓存大小 | `ModelRunner.allocate_kv_cache()` | 区分 token 容量、block 数量、字节数以及每卡 KV heads |
+| 8、9：greedy/top-k 扩展 | `sampling_params.py`、`sampler.py` | 新分支有输入校验与测试，不只删除现有断言 |
+| 10、11：流式/公平性 | `LLMEngine.step/generate()`、`Scheduler.schedule()` | 先写清接口行为和调度策略，再修改实现 |
+
+前缀实验建议先顺序执行两次 generate，检查第一次释放后保留的完整块是否被第二次复用；再研究并发引用。不要用短于 256 token 的相同开头期待块级命中。
 
 ---
 
