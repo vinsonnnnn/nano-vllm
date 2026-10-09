@@ -3,8 +3,8 @@
 > 适用代码：本仓库 `nano-vllm 0.2.0`，教程依据当前工作区源码编写。
 > 适合读者：会一点点 Python 更好；完全不了解大语言模型、PyTorch、CUDA 或 vLLM 也可以从头读。
 > 学习目标：不仅会运行示例，还能说清一次文本生成怎样经过调度器、模型、KV Cache 和采样器，最终变成输出文字。
-> 本次修订：2026-10-08。按仓库源码逐一核对对象的创建点、调用者、字段读写和返回路径；保留原有基础章节，补充源码伴读。
-> 源码基线：修订开始时的提交 `44cdb1b`；本次只修改教学文档，不修改推理代码。
+> 本次修订：2026-10-09。在源码调用链基础上，给全部 Python 代码块补充逐行解释，并增加参数、变量、函数和常用操作查阅。
+> 源码基线：修订开始时的提交 `2a8302a`；本次只修改教学文档，不修改推理代码。
 
 ## 怎样使用这份笔记
 
@@ -14,6 +14,10 @@
 
 - **源码节选**：上方注明仓库文件和类/方法。需要在原文件中结合缩进和上下文阅读，通常不能单独复制运行；标有“省略”的地方不是完整实现。
 - **教学示例**：使用假设 token、假设采样结果或简化形状，帮助你手算状态。它不代表真实 tokenizer 编号、模型权重或随机输出。
+
+代码块中的 `#` 行是本教程添加的解释，不一定存在于项目原文件中。注释不会执行：它解释紧接着的代码做什么、名字从哪来、结果到哪里去；其余原语句保持原样。
+
+若遇到一个不认识的参数或变量，先看旁边的注释，再查第 **2.14 节和第 28 章**。参数指函数定义括号里的接收名字，变量指程序运行中绑定的数据，成员属性指 `self.xxx`；这三者可能名字相同，但所属对象和作用范围不同。
 
 文件链接都相对于项目根目录。可以点击链接，也可以在 VS Code 按 `Ctrl + P` 输入文件路径，再按 `Ctrl + F` 搜索文中指定的 `def` 或 `class`。方法名比固定行号更稳定；你增加注释以后仍然能找到对应代码。
 
@@ -50,6 +54,7 @@
 - [25. 当前实现的边界与容易忽略的行为](#25-当前实现的边界与容易忽略的行为)
 - [26. 从简单到进阶的练习](#26-从简单到进阶的练习)
 - [27. 术语表与速查表](#27-术语表与速查表)
+- [28. 源码参数、变量和函数逐项查阅](#28-源码参数变量和函数逐项查阅)
 
 ---
 
@@ -184,6 +189,8 @@ EOS 是 End Of Sequence，即“文本结束”特殊 token。默认情况下，
 导入：
 
 ```python
+# 从nanovllm.engine.llm_engine导入名字LLMEngine；定义公开生成接口和主循环LLMEngine。导入名字不等于构造对象
+# 。
 from nanovllm.engine.llm_engine import LLMEngine
 ```
 
@@ -192,7 +199,9 @@ from nanovllm.engine.llm_engine import LLMEngine
 类与继承：
 
 ```python
+# 定义类LLM，继承LLMEngine的行为；这里只声明对象结构，执行类名(...)才创建实例。
 class LLM(LLMEngine):
+    # 空语句占位；LLM 在这里不重写父类行为，因此沿用 LLMEngine 的构造函数和方法。
     pass
 ```
 
@@ -201,8 +210,11 @@ class LLM(LLMEngine):
 构造函数与 `self`：
 
 ```python
+# 定义类Sequence；这里只声明对象结构，执行类名(...)才创建实例。
 class Sequence:
+    # 定义构造函数：self 是正在创建的实例，后续参数由类名(...)调用提供；构造函数初始化字段，通常不返回业务结果。
     def __init__(self, token_ids):
+        # 基础语法简化例子：保存传入列表引用；真实项目构造函数使用 copy(token_ids)，两者不能混为一谈。
         self.token_ids = token_ids
 ```
 
@@ -211,6 +223,7 @@ class Sequence:
 类型标注：
 
 ```python
+# 类型标注示意：prompt 可以是字符串或整数列表；竖线表示联合类型，不是按位运算，也不自动校验数据。
 prompt: str | list[int]
 ```
 
@@ -219,6 +232,7 @@ prompt: str | list[int]
 列表推导式：
 
 ```python
+# seqs 是本轮请求列表；逐个读取 seq.temperature，得到与请求顺序相同的 Python 温度列表。
 temperatures = [seq.temperature for seq in seqs]
 ```
 
@@ -227,6 +241,7 @@ temperatures = [seq.temperature for seq in seqs]
 切片：
 
 ```python
+# start 是起始下标，end 是停止下标且不包含它；结果是原 token 列表的一段，不会修改原列表。
 token_ids[start:end]
 ```
 
@@ -235,6 +250,7 @@ token_ids[start:end]
 字典：
 
 ```python
+# outputs 在这里是结果字典；用请求编号 seq_id 作为键，保存该请求完整的 completion token 列表。
 outputs[seq_id] = token_ids
 ```
 
@@ -243,9 +259,13 @@ outputs[seq_id] = token_ids
 特殊方法（dunder method）：
 
 ```python
+# 特殊方法名字，Python 执行 len(seq) 时自动调用，项目返回 num_tokens。
 __len__       # len(seq) 时调用
+# 特殊方法名字，seq[i] 或 seq[start:end] 时自动调用，项目访问 token_ids。
 __getitem__   # seq[i] 或 seq[a:b] 时调用
+# pickle 保存对象时使用的状态导出方法，不是每轮推理都会手动调用。
 __getstate__  # pickle 序列化时调用
+# pickle 恢复对象时使用的方法，与 __getstate__ 返回状态格式配套。
 __setstate__  # pickle 反序列化时调用
 ```
 
@@ -256,10 +276,14 @@ __setstate__  # pickle 反序列化时调用
 先理解一个前提：Python 中的函数也是对象，可以保存到变量中，也可以作为参数传给其他函数。
 
 ```python
+# 定义问候函数：name 是接收的名字字符串，返回一份格式化问候字符串。
 def say_hello(name):
+    # 执行返回表达式f"你好，{name}！"并结束当前函数，将结果交给调用者；return不同于print。
     return f"你好，{name}！"
 
+# 不带括号，保存函数对象到另一个名字；此行不执行 say_hello，也不会立即生成问候。
 greet = say_hello          # 保存函数对象，此时没有执行函数
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(greet("小明"))      # 调用函数，输出：你好，小明！
 ```
 
@@ -270,17 +294,23 @@ print(greet("小明"))      # 调用函数，输出：你好，小明！
 假设 `decorate` 是一个接收函数并返回处理后对象的装饰器：
 
 ```python
+# 把原函数交给名为decorate的装饰器，返回的对象再绑定到原函数名。
 @decorate
+# 定义无参数教学函数，演示装饰器如何处理函数对象；省略号表示暂不提供具体业务逻辑。
 def work():
+    # 省略业务实现或参数的教学占位Ellipsis；不是已实现的完整功能，不可据此直接运行实际推理。
     ...
 ```
 
 从理解机制的角度，它相当于：
 
 ```python
+# 定义无参数教学函数，演示装饰器如何处理函数对象；省略号表示暂不提供具体业务逻辑。
 def work():
+    # 省略业务实现或参数的教学占位Ellipsis；不是已实现的完整功能，不可据此直接运行实际推理。
     ...
 
+# 定义后把原函数交给装饰器，返回的包装对象重新绑定为 work；等价于上方 @decorate 的机制。
 work = decorate(work)
 ```
 
@@ -293,27 +323,44 @@ work = decorate(work)
 下面的例子不依赖 PyTorch，可以直接运行：
 
 ```python
+# 从functools导入名字wraps；提供wraps等函数工具，帮助装饰器保留原函数信息。导入名字不等于构造对象。
 from functools import wraps
 
+# 定义装饰器：func 是被装饰的原函数对象，返回 wrapper 包装函数；装饰发生在函数定义时。
 def trace(func):
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print("正在装饰：", func.__name__)
 
+    # 复制原func的名称/文档等元数据到包装函数，方便调试；不负责调用原函数。
     @wraps(func)
+    # 定义内部包装函数：*args收集位置参数tuple，**kwargs收集关键字dict；闭包保存外层原函数及配置。
     def wrapper(*args, **kwargs):
+        # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
         print("进入函数：", func.__name__)
+        # 进入可能抛异常的操作块；异常时寻找except，退出时仍执行对应finally。
         try:
+            # 调用保存的原函数并把业务返回值传回外部，位置/关键字参数原样展开。
             return func(*args, **kwargs)
+        # 无论try正常返回还是抛异常，离开时都执行此清理块；不是只在失败时执行。
         finally:
+            # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
             print("离开函数：", func.__name__)
 
+    # 返回包装函数对象，不执行它；之后通过被装饰的名字调用才会进入wrapper。
     return wrapper
 
+# 将下方原函数交给trace装饰，之后名字指向返回的wrapper；定义时和调用时行为不同。
 @trace
+# 定义教学加法函数，a/b是输入数，返回相加结果；外层@trace会增加调用日志。
 def add(a, b):
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print("原函数正在计算")
+    # 计算两个数的和并返回；离开with/finally时仍会先执行正常退出清理。
     return a + b
 
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print("开始调用")
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print("结果：", add(2, b=3))
 ```
 
@@ -350,33 +397,52 @@ print("结果：", add(2, b=3))
 **③ 为什么有些装饰器带括号，有些不带？**
 
 ```python
+# 将下方原函数交给trace装饰，之后名字指向返回的wrapper；定义时和调用时行为不同。
 @trace                  # 直接把原函数交给 trace
+# 无参数教学函数，直接使用@trace装饰；名字不是项目中的引擎方法。
 def first():
+    # 省略业务实现或参数的教学占位Ellipsis；不是已实现的完整功能，不可据此直接运行实际推理。
     ...
 
+# 先用次数3创建装饰器，再处理下方函数；真正调用函数时才重复执行原业务。
 @repeat(3)              # 先调用 repeat(3)，取得装饰器，再装饰原函数
+# 无参数教学函数，演示带参数装饰器；repeat(3)先生成真正的装饰器。
 def second():
+    # 省略业务实现或参数的教学占位Ellipsis；不是已实现的完整功能，不可据此直接运行实际推理。
     ...
 ```
 
 带参数的完整例子：
 
 ```python
+# 从functools导入名字wraps；提供wraps等函数工具，帮助装饰器保留原函数信息。导入名字不等于构造对象。
 from functools import wraps
 
+# 定义装饰器工厂：times是重复次数，返回decorate，后者再接收真正的函数。
 def repeat(times):
+    # 定义实际装饰器：func是待处理函数，内部wrapper使用外层的times/func；返回包装函数。
     def decorate(func):
+        # 复制原func的名称/文档等元数据到包装函数，方便调试；不负责调用原函数。
         @wraps(func)
+        # 定义内部包装函数：*args收集位置参数tuple，**kwargs收集关键字dict；闭包保存外层原函数及配置。
         def wrapper(*args, **kwargs):
+            # times 是重复次数；range产生times次循环，_ 接收循环编号但示例不使用它。
             for _ in range(times):
+                # func 是保存的原函数；*展开位置参数tuple，**展开关键字dict，包装器将参数原样转交。
                 func(*args, **kwargs)
+        # 返回包装函数对象，不执行它；之后通过被装饰的名字调用才会进入wrapper。
         return wrapper
+    # 返回装饰器对象，此时尚未接收被装饰函数；repeat(times)先产生这一对象。
     return decorate
 
+# 先用次数3创建装饰器，再处理下方函数；真正调用函数时才重复执行原业务。
 @repeat(3)
+# 定义问候教学函数：name是名字；当前示例装饰器重复调用它，但不汇总返回值。
 def greet(name):
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print(f"你好，{name}")
 
+# 调用被装饰后的函数，"小明" 作为 name；repeat(3) 会执行原函数三次。
 greet("小明")            # 打印三次：你好，小明
 ```
 
@@ -389,9 +455,13 @@ greet("小明")            # 打印三次：你好，小明
 下面的 `outer` 和 `inner` 是用于解释顺序的示意名字：
 
 ```python
+# 装饰器示意：位于外层，定义时最终得到outer(inner(work))；这里不是项目实际函数名。
 @outer
+# 装饰器示意：先处理原函数，然后结果交给外层outer；顺序可能影响运行行为。
 @inner
+# 定义无参数教学函数，演示装饰器如何处理函数对象；省略号表示暂不提供具体业务逻辑。
 def work():
+    # 省略业务实现或参数的教学占位Ellipsis；不是已实现的完整功能，不可据此直接运行实际推理。
     ...
 ```
 
@@ -414,17 +484,27 @@ def work():
 `@property` 的独立例子：
 
 ```python
+# 定义类Task；这里只声明对象结构，执行类名(...)才创建实例。
 class Task:
+    # 定义构造函数：self 是正在创建的实例，后续参数由类名(...)调用提供；构造函数初始化字段，通常不返回业务结果。
     def __init__(self):
+        # Task 教学对象初始未完成；前导下划线是约定为内部字段，不是 Python 自动限制访问。
         self._finished = False
 
+    # 把下方方法变成属性getter，用obj.name读取就执行；通常不写obj.name()，不自动缓存结果。
     @property
+    # 定义property的getter：self是当前Task示例，读取内部_finished字段并返回布尔值。
     def is_finished(self):
+        # 返回Task教学对象当前布尔完成标志，property每次读取都会重新执行此行。
         return self._finished
 
+# 创建独立教学实例，进入 Task.__init__；不是 nano-vllm 的真实请求类。
 task = Task()
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(task.is_finished)       # False，访问时执行属性的 getter
+# 修改底层普通字段，下次读取 is_finished property 就会重新得到 True。
 task._finished = True
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(task.is_finished)       # True，再次读取时重新计算
 ```
 
@@ -443,17 +523,27 @@ print(task.is_finished)       # True，再次读取时重新计算
 `dataclass` 是“装饰类”的例子。下面是项目 `SamplingParams` 的字段结构：
 
 ```python
+# 从dataclasses导入名字dataclass；提供dataclass/fields，自动构造配置对象并查询声明字段。导入名字不等于构造对象。
 from dataclasses import dataclass
 
+# 装饰下方配置类并生成构造等方法；slots=True限制未声明字段，不会冻结已声明字段。
 @dataclass(slots=True)
+# 定义类SamplingParams；这里只声明对象结构，执行类名(...)才创建实例。
 class SamplingParams:
+    # dataclass 字段：温度期望为浮点，未传参时默认1.0；类型标注本身不做数值校验。
     temperature: float = 1.0
+    # 字段类型为整数，默认最多新增64个token；不包含输入prompt。
     max_tokens: int = 64
+    # 布尔字段默认不忽略结束符；False和True不是文字字符串。
     ignore_eos: bool = False
 
+# 用关键字设置温度与新输出上限，ignore_eos 使用默认False；生成构造函数会调用 __post_init__。
 params = SamplingParams(temperature=0.6, max_tokens=256)
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(params.temperature)     # 0.6
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(params.ignore_eos)      # False，使用默认值
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(params)                # 显示类名和字段值，方便调试
 ```
 
@@ -474,11 +564,16 @@ print(params)                # 显示类名和字段值，方便调试
 在项目目录运行：
 
 ```python
+# 文件名相对当前工作目录，r表示只读，encoding指定文字解码；f是进入上下文后取得的文件对象。
 with open("README.md", "r", encoding="utf-8") as f:
+    # 读取一行文字保存为str，通常包含末尾换行；不是读取整个文件。
     first_line = f.readline()
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print(first_line.strip())
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print(f.closed)           # False：文件还在使用
 
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(f.closed)               # True：离开 with 后文件已关闭
 ```
 
@@ -498,18 +593,26 @@ print(f.closed)               # True：离开 with 后文件已关闭
 普通写法：
 
 ```python
+# 手动打开文件取得对象，此写法需要自行确保关闭；发生异常时后面的close可能没机会执行。
 f = open("README.md", "r", encoding="utf-8")
+# 从当前位置读取剩余文件内容，结果是字符串content；大小取决于文件，不是按行列表。
 content = f.read()
+# 关闭文件资源；已读出的content字符串仍然存在，不能继续用已关闭对象读取。
 f.close()
 ```
 
 如果 `f.read()` 抛出异常，最后一行可能来不及执行。用 `try/finally` 可以明确安排清理：
 
 ```python
+# 手动打开文件取得对象，此写法需要自行确保关闭；发生异常时后面的close可能没机会执行。
 f = open("README.md", "r", encoding="utf-8")
+# 进入可能抛异常的操作块；异常时寻找except，退出时仍执行对应finally。
 try:
+    # 从当前位置读取剩余文件内容，结果是字符串content；大小取决于文件，不是按行列表。
     content = f.read()
+# 无论try正常返回还是抛异常，离开时都执行此清理块；不是只在失败时执行。
 finally:
+    # 关闭文件资源；已读出的content字符串仍然存在，不能继续用已关闭对象读取。
     f.close()
 ```
 
@@ -520,19 +623,31 @@ finally:
 可以自己写一个只打印过程的管理器：
 
 ```python
+# 定义类StudyContext；这里只声明对象结构，执行类名(...)才创建实例。
 class StudyContext:
+    # 定义进入上下文的方法：self是StudyContext实例；返回值将交给with语句的as变量。
     def __enter__(self):
+        # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
         print("进入上下文")
+        # 把此字符串交给with的as变量；返回值不一定是管理器self。
         return "提供给代码块的值"
 
+    # 定义退出方法：exc_type是异常类型，exc_value是异常对象，traceback是调用链；返回假值让异常继续传播。
     def __exit__(self, exc_type, exc_value, traceback):
+        # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
         print("退出上下文")
+        # __exit__收到的异常类型不为None，表示with块内异常退出；正常退出时三个异常参数都是None。
         if exc_type is not None:
+            # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
             print("发现异常：", exc_type.__name__)
+        # 告诉上下文协议不要吞掉异常，异常继续向外传播；正常退出时同样结束此方法。
         return False         # 不吞掉异常，让它继续向外传播
 
+# 创建管理器并执行 __enter__；其返回值绑定到value，不保证value就是管理器自身。
 with StudyContext() as value:
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print(value)
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print("执行代码块")
 ```
 
@@ -550,11 +665,17 @@ with StudyContext() as value:
 再运行下面的异常示例，沿用上面定义的 `StudyContext`：
 
 ```python
+# 进入可能抛异常的操作块；异常时寻找except，退出时仍执行对应finally。
 try:
+    # 创建管理器并执行 __enter__；其返回值绑定到value，不保证value就是管理器自身。
     with StudyContext() as value:
+        # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
         print("准备触发异常")
+        # 主动抛出带说明的异常，中断当前块；先执行with退出协议，再寻找外层except。
         raise ValueError("示例错误")
+# 捕获指定类型异常；as后的error是异常对象，不是错误文字常量，处理后可继续执行后续语句。
 except ValueError as error:
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print("外层捕获：", error)
 ```
 
@@ -577,8 +698,13 @@ except ValueError as error:
 项目源码 `utils/loader.py`：
 
 ```python
+# file 是权重文件路径，"pt" 表示 PyTorch Tensor，"cpu" 表示先读到 CPU；f 是提供 keys/get_tensor
+# 的读取对象。
 with safe_open(file, "pt", "cpu") as f:
+    # keys 返回文件中参数名字；weight_name 是如 model.layers.0.self_attn.q_proj.weight 的字符串，
+    # 不是 Tensor。
     for weight_name in f.keys():
+        # 按完整参数名字读取训练权重 Tensor，存为 loaded_weight；之后还需复制到实际模型参数。
         loaded_weight = f.get_tensor(weight_name)
 ```
 
@@ -587,7 +713,9 @@ with safe_open(file, "pt", "cpu") as f:
 项目源码 `ModelRunner.capture_cudagraph` 中还有：
 
 ```python
+# 进入CUDA Graph捕获环境；graph接收记录，graph_pool用于复用图内存池，首次可以为None。
 with torch.cuda.graph(graph, self.graph_pool):
+    # 用固定输入/位置缓冲区执行Qwen3，输出复制到固定hidden-state缓冲区；位于with内时被捕获，外部时用于预热。
     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
 ```
 
@@ -597,7 +725,9 @@ with torch.cuda.graph(graph, self.graph_pool):
 
 ```python
 # 示意：model、input_ids、positions 需先创建
+# 只在此缩进块启用推理模式，关闭梯度记录并减少追踪开销；不自动加载模型或切换eval。
 with torch.inference_mode():
+    # 示意调用：model及两个输入需先创建，返回隐藏状态；不是一个可独立运行的完整脚本。
     hidden_states = model(input_ids, positions)
 ```
 
@@ -610,15 +740,20 @@ with torch.inference_mode():
 **① 基本语法与执行结果**
 
 ```python
+# 语法示意：普通模式下条件为假就抛AssertionError；“条件”不是项目中已定义的变量。
 assert 条件
+# 逗号后是失败说明，不是第二个检查条件；-O优化模式会移除assert。
 assert 条件, "失败时的说明"
 ```
 
 正常 Python 运行模式下，条件为真就继续执行，条件为假就抛出 `AssertionError`：
 
 ```python
+# 教学普通变量，不属于某个SamplingParams实例；用它演示数值检查。
 temperature = 0.6
+# 1e-10是10的负10次方；条件失败会抛异常，不会自动调整temperature。
 assert temperature > 1e-10, "temperature 必须大于 1e-10"
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print("检查通过")             # 会执行
 ```
 
@@ -627,7 +762,9 @@ print("检查通过")             # 会执行
 从理解普通模式行为的角度，断言类似：
 
 ```python
+# 普通条件分支写法，not反转布尔结果；不像assert，会在优化模式下仍然执行。
 if not (temperature > 1e-10):
+    # 主动创建断言异常，与普通模式assert失败相似，但这行不会因为-O自动消失。
     raise AssertionError("temperature 必须大于 1e-10")
 ```
 
@@ -651,15 +788,23 @@ if not (temperature > 1e-10):
 `assert` 是产生异常的一种方式；`raise` 可以主动抛出指定异常；`try/except` 则负责在异常发生后处理它：
 
 ```python
+# value是调用者输入的数，先检查为正，再原样返回；这个教学函数用assert展示失败。
 def require_positive(value):
+    # require_positive函数检查传入value为正；失败会进入外层捕获逻辑。
     assert value > 0, "value 应当为正数"
+    # 通过校验后将原value交给调用者，并结束当前函数。
     return value
 
+# 进入可能抛异常的操作块；异常时寻找except，退出时仍执行对应finally。
 try:
+    # 传入非法示例值0，故意触发AssertionError，让你观察异常传播。
     require_positive(0)
+# 捕获指定类型异常；as后的error是异常对象，不是错误文字常量，处理后可继续执行后续语句。
 except AssertionError as error:
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print("断言失败：", error)
 
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print("异常已被处理，继续执行")
 ```
 
@@ -687,9 +832,13 @@ python -O your_script.py
 例如用户传入非法温度，应当明确检查：
 
 ```python
+# temperature是待校验温度，非法时抛ValueError，合法时返回原数值；使用普通if而不是可被-O移除的assert。
 def validate_temperature(temperature):
+    # 用普通分支检查不允许的温度，检查逻辑在优化模式仍保留。
     if temperature <= 1e-10:
+        # 将非法参数明确报告为ValueError；调用者可捕获并给用户反馈。
         raise ValueError("temperature 必须大于 1e-10")
+    # 通过校验后返回原温度，不调整输入或生成随机数。
     return temperature
 ```
 
@@ -698,6 +847,7 @@ def validate_temperature(temperature):
 不要把必要操作藏在断言里，例如：
 
 ```python
+# 反例：把有副作用的分配动作藏在assert里，-O会连分配函数调用一起删除。
 assert allocate_block()       # 反例：-O 模式下连分配操作都不执行
 ```
 
@@ -706,7 +856,9 @@ assert allocate_block()       # 反例：-O 模式下连分配操作都不执行
 **⑤ 一个容易写错的形式**
 
 ```python
+# 反例：括号和逗号构成非空tuple，tuple本身为真，不能正确检查condition。
 assert (condition, "说明")    # 错误：检查的是非空 tuple
+# 正确assert形式，真正检查condition，失败时附带说明字符串。
 assert condition, "说明"      # 正确：检查 condition
 ```
 
@@ -723,12 +875,18 @@ assert condition, "说明"      # 正确：检查 condition
 沿用上面已定义的 `trace` 和 `StudyContext`，可以把它们组合起来：
 
 ```python
+# 将下方原函数交给trace装饰，之后名字指向返回的wrapper；定义时和调用时行为不同。
 @trace
+# a、b是加法输入；函数演示装饰器、with和assert配合，非负校验后返回和。
 def checked_add(a, b):
+    # 此处不需要__enter__的返回值，省略as；依然会进入并在退出时执行管理器协议。
     with StudyContext():
+        # 两个输入都必须非负；and要求两条件都成立，失败仍会触发with退出和finally。
         assert a >= 0 and b >= 0, "示例只接受非负数"
+        # 计算两个数的和并返回；离开with/finally时仍会先执行正常退出清理。
         return a + b
 
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(checked_add(2, 3))
 ```
 
@@ -747,8 +905,12 @@ print(checked_add(2, 3))
 模型类通常继承 `nn.Module`：
 
 ```python
+# 定义类Sampler，继承nn.Module的行为；这里只声明对象结构，执行类名(...)才创建实例。
 class Sampler(nn.Module):
+    # 定义Sampler前向：logits为[B,V]词表分数，temperatures为[B]逐请求温度；返回[B]整数采样ID，self是Sample
+    # r实例。
     def forward(self, logits, temperatures):
+        # 省略业务实现或参数的教学占位Ellipsis；不是已实现的完整功能，不可据此直接运行实际推理。
         ...
 ```
 
@@ -757,6 +919,7 @@ class Sampler(nn.Module):
 `nn.Parameter` 表示模型参数：
 
 ```python
+# output_size是输出宽度，input_size是输入宽度；empty只分配未初始化存储，Parameter把它登记为模型参数。
 self.weight = nn.Parameter(torch.empty(output_size, input_size))
 ```
 
@@ -765,8 +928,11 @@ self.weight = nn.Parameter(torch.empty(output_size, input_size))
 设备与数据类型：
 
 ```python
+# 把x转到当前CUDA GPU并返回Tensor；表达式未赋值时不会自动重绑定变量x。
 x.cuda()            # 把 Tensor 放到当前 CUDA GPU
+# 返回float32工作Tensor；不是移动到CPU，也不是Python内置float(x)。
 x.float()           # 转成 float32
+# 将Tensor转换回先前保存的数据类型；设备不因只传dtype而被改成CPU。
 x.to(orig_dtype)    # 转回原数据类型
 ```
 
@@ -775,8 +941,11 @@ x.to(orig_dtype)    # 转回原数据类型
 形状变换：
 
 ```python
+# 重解释为token数、头数、头维三个维度；这里-1表示自动推断长度，元素总数必须一致。
 x.view(-1, num_heads, head_dim)
+# 合并第1维到最后一维；这里-1表示最后一个维度下标，不是推断维度长度。
 x.flatten(1, -1)
+# 沿最后一维拆成2份并返回tuple；这里2是份数，-1是维度，不是每份的元素数。
 x.chunk(2, -1)
 ```
 
@@ -815,6 +984,143 @@ y = x Wᵀ + b
 另一个常见困惑是 `self`：在 `LLMEngine.step()` 中，`self` 是引擎；在 `Sequence.append_token()` 中，它是某一条请求；在 `Attention.forward()` 中，它是模型某一层的 Attention 模块。`self` 不是全项目共享的一个万能对象。
 
 阅读每个类时，可以在纸上写下三列：构造函数创建的成员、当前函数接收的参数、当前函数返回的结果。随后用第 7.1 节的表找到上游和下游，避免只盯着一个文件猜它如何运行。
+
+### 2.14 不要被名字和小符号卡住：源码操作查阅
+
+#### 2.14.1 形参、实参、局部变量、成员属性
+
+以 `seq.append_token(40)` 为例：
+
+- `40` 是调用时给出的**实参**。
+- 定义 `def append_token(self, token_id)` 中的 `token_id` 是接收实参的**形参**；这次等于 40。
+- `self` 是当前调用对象 `seq`，Python 调用实例方法时自动提供。你不需要写 `seq.append_token(seq, 40)`。
+- `self.last_token` 是这条 Sequence 的**成员属性**，不同请求各有一份。
+- `Sequence.block_size` 是**类属性**，当前进程内的 Sequence 实例共享这个配置，除非实例另行覆盖。
+- `token_id` 这个参数名字只在当前函数中使用；返回函数后，并不会自动变成外部同名变量。
+
+同名 `self.model` 在 `Config` 中是路径字符串，在 `ModelRunner` 中是 Qwen3 网络，在 `Qwen3ForCausalLM` 中是内部 Qwen3Model。不要仅凭名字猜类型，要回到当前类的构造函数看赋值来源。
+
+#### 2.14.2 Python 内置函数、容器方法和运算符
+
+| 写法 | 参数/符号是什么意思 | 返回什么或改变什么 | 项目例子 |
+|---|---|---|---|
+| `len(x)` | x 是列表、队列或定义了 `__len__` 的对象 | 返回整数长度，不修改 x | `len(seq)` 返回 `num_tokens` |
+| `range(start, end)` | 左端包含，右端不包含；单参数从 0 开始 | 可迭代整数范围，不直接创建列表 | `range(0, 3)` 遍历 0、1、2 |
+| `list(range(300))` | 把范围展开成列表 | `[0,1,...,299]` | CPU 教学请求 |
+| `next(counter)` | counter 是迭代器 | 取下一个编号并推进它 | 为新 Sequence 分配 ID |
+| `isinstance(x, T)` | 检查 x 是否是类型 T 的实例 | bool，不进行类型转换 | 区分文字和 token 列表 |
+| `getattr(obj, name, default)` | 按字符串 name 查对象属性 | 属性值；没有时用 default | 用 `'run'` 找方法对象 |
+| `hasattr(obj, name)` | name 是属性名字符串 | bool | 查找带缓存字段的模块 |
+| `zip(a, b)` | 按位置配对两份可迭代数据 | 每次产出二元组，按较短一侧停止 | 请求和对应采样 token |
+| `print(*values, sep=' ', end='\n')` | values是要显示的值；sep分隔多个值，end指定末尾 | 默认输出到终端并换行，返回None | 教学日志，不修改seq |
+| `sum(values)` | 累加整数/浮点值 | 总和 | 统计本轮 Prefill token |
+| `min(a,b)` / `max(a,b)` | 比较两个数 | 取较小/较大数 | 预算裁剪、最大序列长度 |
+| `sorted(d.keys())` | 获取字典键并排序 | 新列表，不重排原字典 | 恢复请求提交顺序 |
+| `d.get(key, -1)` | 字典查询，-1 是未命中默认值 | 对应值或 -1，不添加键 | 查前缀哈希 |
+| `d.items()` | 遍历字典 | 每次产出 `(key,value)` | 过滤引擎 kwargs |
+| `append(x)` / `extend(xs)` | 前者加入一个元素，后者加入一批元素 | 原地修改列表，通常返回 None | 单个 Decode ID / Prefill 片段 |
+| `popleft()` / `pop()` | deque 左端取出 / 默认右端取出 | 返回并删除一个对象引用 | 等待顺序、抢占尾部请求 |
+| `appendleft(x)` | deque 左端加入对象 | 修改队列，返回 None | 抢占请求等待重算 |
+| `remove(x)` / `clear()` | 删除指定对象 / 清空容器 | 原地修改，不产生新请求 | 完成请求退队、清空块表 |
+| `x is None` | 判断是否就是 None 这个对象 | bool | 首层是否有 residual |
+| `selected is record` | 判断是否同一个对象 | bool；不同于内容相等 | 验证引用传递 |
+| `a and b` / `a or b` | 逻辑组合并短路；容器也可当条件 | 依条件结果判断流程 | 空队列、EOS 判停 |
+| `n // b` / `n % b` | 整除 / 余数 | 整数商 / 余数 | 块数和块内边界 |
+| `seq[-1]` / `seq[a:b]` | 最后一项 / 左闭右开切片 | 一个 ID / ID 列表 | 末 token、Prefill 片段 |
+| `*args` / `**kwargs` | 定义处收集参数，调用处展开参数 | tuple / dict 或转交实参 | 动态方法与装饰器 |
+| `float`、`int`、`bool` | 类型名字，不是当前变量值 | 用于标注或显式转换 | 温度、长度、开关 |
+
+方法返回 None 的时候，不能写 `seq.block_table = seq.block_table.clear()`：那会把块表变量改成 None，而不是保留一个空列表。项目使用单独的 `.clear()` 调用。
+
+`print` 的 `file` 参数可以指定输出流，默认是标准输出；`flush=True` 请求立即刷新，而不是等待缓冲。模型源码中的print只用于观察，不能替代return给调用者传值。[Python print 官方说明](https://docs.python.org/3/library/functions.html#print)
+
+#### 2.14.3 张量方法的每个参数都在控制什么
+
+本表中的 T 为本轮输入 token 数，B 为请求数，H 为隐藏维，V 为词表大小。表中操作需要真实 Tensor，不是普通 Python 整数列表。
+
+| 调用 | 参数含义 | 对形状、数据或设备的作用 |
+|---|---|---|
+| `torch.empty(a,b,...)` | 各参数是维度长度 | 分配未初始化 Tensor；不能假设值为 0 |
+| `torch.zeros(a,b,...)` | 维度长度 | 分配并填 0，图缓冲区使用它 |
+| `torch.tensor(values, dtype=..., pin_memory=True)` | values 是 CPU 数据，dtype 是元素类型 | 创建固定类型的 Tensor；锁页内存支持高效 CPU→GPU 传输 |
+| `.cuda(non_blocking=True)` | 使用当前 CUDA GPU，允许非阻塞传输 | 返回 GPU Tensor；“允许”不等于完全没有同步开销 |
+| `.float()` / `.to(orig_dtype)` | FP32 / 指定保存的精度 | 转换数据类型，不改变所表达的形状 |
+| `.size(0)` / `.shape` | 第 0 维 / 所有维度 | 返回长度 / 形状元组，不是读取全部数值 |
+| `.numel()` | 无参数 | 总元素数；空缓存为 0 |
+| `.stride(i)` | 第 i 维 | 相邻元素沿该维前进时的存储元素距离，不是该维长度 |
+| `.view(-1,heads,d)` | -1 自动推断 T；其余指定长度 | 重解释成 `[T,heads,d]`；要求元素总数及存储布局兼容 |
+| `.flatten(1,-1)` | 从第 1 维到最后一维 | 合并 head 相关维，保留 token 维 |
+| `.chunk(2,dim=-1)` | 沿最后维切成 2 份 | 返回 Tensor 的 tuple，通常用 `x,y` 接收 |
+| `.split([q,k,v],dim=-1)` | 按三个明确宽度切最后维 | 返回 3 份，允许宽度不同 |
+| `.unsqueeze(dim=1)` | 在索引 1 处插入长度 1 的维度 | `[B]` 变 `[B,1]`，便于温度广播 |
+| `.pow(2)` | 指数 2 | 逐元素平方，不改变形状 |
+| `.mean(dim=-1,keepdim=True)` | 最后维求均值并保留该维 | `[T,H]` 变 `[T,1]`，与 x 广播计算 |
+| `torch.rsqrt(x)` | 输入数值 | 逐元素计算 `1/sqrt(x)` |
+| `torch.softmax(x,dim=-1)` | 沿最后维归一化 | logits→概率，形状仍为 `[B,V]` |
+| `.argmax(dim=-1)` | 沿最后维选最大位置 | `[B,V]`→`[B]` 的下标 Tensor |
+| `torch.cat(xs,dim=-1)` | xs 是 Tensor 序列，沿最后维拼接 | 合并 RoPE 两半或不同 rank 的词表分数 |
+| `.contiguous()` | 无参数 | 返回连续布局，可能复制数据，不改变数值意义 |
+| `.tolist()` | 无参数 | Tensor→Python 标量/嵌套列表，GPU 情况需读取结果到 CPU |
+| `.copy_(src)` | src 是数据来源 | 复制数值到当前 Tensor 存储，不重新创建模型参数 |
+| `.mul_(y)` / `.div_(y)` | 乘数 / 除数，可广播 | 原地修改当前 Tensor 数值；结尾下划线不是减号 |
+| `.fill_(-1)` / `.zero_()` | 填充值 -1 / 0 | 原地重置图缓冲区，防止残留旧数据 |
+| `.exponential_(1)` | 指数分布的 rate 为 1 | 用随机数原地填充 Tensor，不是对原值取指数 |
+| `.clamp_min_(1e-10)` | 最小允许值 | 原地将过小值截到下限，避免采样分母太小 |
+| `F.linear(x,weight,bias)` | 输入、权重、可选偏置 | `x @ weight.T + bias`；无 bias 时省略它 |
+| `F.embedding(ids,weight)` | 整数ID、词表权重 | 按ID查权重行，得到隐藏向量 |
+| `F.silu(x)` | 输入向量 | 逐元素计算 `x*sigmoid(x)`，用于门控 MLP |
+
+**同一个 `-1`，不同函数里含义不同**：在 `view` 里是推断维度，在 `dim=-1` 里是最后一维，在 `slot_mapping` 数值里是无效位置，在哈希查询里是未命中哨兵。不要把它们当成同一个概念。
+
+Sampler的 `.exponential_(1)` 使用指数分布的速率参数，不是概率温度，也不是对现有数值执行 `exp()`。[PyTorch 2.8 exponential_ 官方说明](https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.exponential_.html)
+
+---
+
+#### 2.14.4 常见模块名和缩写不是函数参数
+
+| 名字 | 代表什么 | 如何理解源码里的点号 |
+|---|---|---|
+| `torch` | PyTorch模块 | `torch.tensor`调用模块函数，不是在某个Sequence上调用方法 |
+| `nn` | `torch.nn`模块的简称 | `nn.Module`是网络基类，`nn.Parameter`是登记的模型参数对象 |
+| `F` | `torch.nn.functional`的简称 | `F.linear/F.silu`是函数式计算，权重或输入由实参提供 |
+| `dist` | `torch.distributed`的简称 | `dist.all_reduce`等是多GPU通信函数，不是地理距离 |
+| `mp` | `torch.multiprocessing`的简称 | `mp.get_context`创建进程上下文，与Attention元数据Context不同 |
+| `np` | NumPy的简称 | `np.array`在CPU创建数组，供哈希处理；不是GPU模型Tensor |
+| `tl` | `triton.language`的简称 | `tl.load/store/arange`用于GPU kernel里的指针与向量操作 |
+| `triton` | Triton模块 | `triton.jit`装饰kernel，使其可以按GPU启动网格执行 |
+| `os` | Python操作系统模块 | `os.path`提供目录、路径拼接与用户目录展开 |
+| `pickle` | Python对象序列化模块 | `dumps`产生bytes，`loads`恢复对象；不是保存训练权重的safetensors |
+| `safe_open` | safetensors提供的读取入口 | 通过with读取文件中的参数名字和Tensor |
+| `tqdm` | 进度条工具 | 显示请求完成数，不参与Qwen3数学计算 |
+| `AutoConfig/AutoTokenizer` | Transformers工具类 | from_pretrained读取配置/分词器，不把整个nano-vllm变成通用模型框架 |
+
+点号既能访问模块函数，也能访问对象的方法/属性。先确认左边是谁：`torch.softmax`、`seq.append_token`、`seq.temperature`分别是模块函数、实例方法和普通属性。
+
+#### 2.14.5 字符串、分词器与其他小操作
+
+| 写法 | 参数/结果解释 |
+|---|---|
+| `f"你好，{name}"` | f前缀让花括号中的表达式求值并嵌入字符串；name必须事先定义 |
+| `f"{output['text']!r}"` | 先取字典中的text，!r再用repr展示，便于看见换行/特殊标记 |
+| `func.__name__` | 读取函数对象的名字字符串，例如'add'；不是调用func |
+| `first_line.strip()` | 返回去掉两端空白/换行后的新字符串，不修改原first_line |
+| `f.closed` | 文件对象当前是否已关闭的bool属性；不是检查读取内容是否为空 |
+| `tokenizer.encode(text)` | str→整数ID列表，不负责应用聊天模板 |
+| `tokenizer.decode(ids)` | 整数ID列表→文字；当前项目未显式要求跳过特殊token |
+| `tokenizer.convert_ids_to_tokens(ids)` | 把每个ID转换成词表里的token表示，返回字符串列表；不等同于连成自然文本 |
+| `os.path.expanduser(path)` | 把~展开为运行系统当前用户目录，返回新路径字符串 |
+| `os.path.join(path, pattern)` | 拼接目录和文件名/匹配模式，不实际读取文件 |
+| `os.path.isdir(path)` | 检查现有目录，返回bool，不创建目录 |
+| `fields(Config)` | 读取dataclass字段描述序列，`.name`取得允许的关键字名字 |
+| `copy(token_ids)` | 复制整数列表容器；不会复制词表或模型，不需要对整数深拷贝 |
+| `count()` / `auto()` | 前者创建可不断next的计数迭代器，后者为枚举项产生自动值 |
+| `1e-10` / `2**20` | 前者是10的负10次方，后者是2的20次方；不是字符串 |
+| `a == b` / `a != b` | 比较值相等/不等；不是赋值运算符= |
+| `n += 1` / `n -= 1` | 读取当前数值，加/减1后重新写入；用于长度或引用计数 |
+| `[params] * B` | 重复B次同一个对象引用，不构造B个独立参数对象 |
+| `x[start:end]` 与 `narrow(dim,start,length)` | 前者第三个位置是右开边界，后者第三个参数是长度；不要混用 |
+
+示例中的 `print` 是“观察”，`return` 是“给调用者返回”，`assert` 是“检查关系”，这三种动作不能互相代替。
 
 ---
 
@@ -888,7 +1194,9 @@ y = x Wᵀ + b
 直接证据位于 [model_runner.py](nanovllm/engine/model_runner.py) 的 `ModelRunner.__init__()`：
 
 ```python
+# nccl是GPU通信后端，tcp地址用于初始化会合，world_size是进程总数，rank是当前编号；不是HTTP服务端口。
 dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+# 将当前进程的默认GPU设为对应rank编号；本项目默认一进程一GPU。
 torch.cuda.set_device(rank)
 ```
 
@@ -1097,6 +1405,7 @@ model.safetensors.index.json（分片权重通常有）
 `example.py` 默认路径正是：
 
 ```python
+# 展开当前运行系统的~用户目录；在WSL中指Linux用户目录，不是Windows用户目录。
 path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 ```
 
@@ -1111,24 +1420,37 @@ python example.py
 ### 5.8 最小测试脚本
 
 ```python
+# 从nanovllm导入名字LLM, SamplingParams；项目公共API，导出LLM和SamplingParams。导入名字不等于构造对象。
 from nanovllm import LLM, SamplingParams
 
+# 占位路径，请替换成实际现有模型目录；不是可以照抄运行的真实路径。
 model_path = "/绝对路径/Qwen3-0.6B"
 
+# 开始构造推理引擎，后续多行是它的实参；创建时就加载权重、预热和分配缓存，并非轻量记录。
 llm = LLM(
+    # 第一个位置参数是本地模型目录字符串；下面关键字参数分别控制引擎行为。
     model_path,
+    # 请求禁用Decode CUDA Graph，便于入门调试；各层torch.compile装饰器仍然存在。
     enforce_eager=True,
+    # 设置单GPU/单rank；不是同时处理请求的数量，也不是模型层数。
     tensor_parallel_size=1,
+    # 设置引擎位置/缓存相关上限为2048；当前代码没有在add_request严格检查prompt+输出长度。
     max_model_len=2048,
 )
 
+# 开始创建单条请求的采样参数；下面关键字是生成策略，不是GPU引擎资源设置。
 params = SamplingParams(
+    # 对每条请求的词表logits除以0.6，让概率分布更集中；仍然是随机采样。
     temperature=0.6,
+    # 最多新生成64个token，达到EOS可能提前结束；不是字符数。
     max_tokens=64,
 )
 
+# prompts使用一个字符串的列表，params用于该请求；函数阻塞到结束，返回一项字典列表。
 outputs = llm.generate(["请用一句话介绍你自己。"], params)
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(outputs[0]["text"])
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(outputs[0]["token_ids"])
 ```
 
@@ -1160,7 +1482,9 @@ VS Code 窗口连接 WSL: Ubuntu
 ### 6.1 导入
 
 ```python
+# 从nanovllm导入名字LLM, SamplingParams；项目公共API，导出LLM和SamplingParams。导入名字不等于构造对象。
 from nanovllm import LLM, SamplingParams
+# 从transformers导入名字AutoTokenizer；读取模型配套配置/分词器，实际网络计算仍由本项目源码实现。导入名字不等于构造对象。
 from transformers import AutoTokenizer
 ```
 
@@ -1173,7 +1497,9 @@ from transformers import AutoTokenizer
 ### 6.2 创建 tokenizer 和引擎
 
 ```python
+# 从path读取配套tokenizer文件；示例用它构造聊天模板，引擎内部还会创建自己的tokenizer。
 tokenizer = AutoTokenizer.from_pretrained(path)
+# path传到继承的LLMEngine构造函数；单卡且不使用Decode图，初始化后保存为llm反复使用。
 llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 ```
 
@@ -1194,6 +1520,7 @@ llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 ### 6.3 设置采样参数
 
 ```python
+# 本例所有请求共享这一参数对象；Sequence创建时会复制温度和上限等字段值。
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 ```
 
@@ -1208,9 +1535,13 @@ sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 ### 6.4 应用聊天模板
 
 ```python
+# 调用模型tokenizer的聊天格式模板，后续实参决定角色、是否立即编码及生成提示。
 tokenizer.apply_chat_template(
+    # 一条消息的列表：role指定用户角色，content放实际问题；列表支持多轮对话格式。
     [{"role": "user", "content": prompt}],
+    # 返回带角色标记的字符串而不是整数ID；LLMEngine.add_request之后再encode。
     tokenize=False,
+    # 在模板末尾加入让模型开始assistant回答的提示标记，具体文字由模型模板决定。
     add_generation_prompt=True,
 )
 ```
@@ -1220,16 +1551,21 @@ tokenizer.apply_chat_template(
 ### 6.5 批量生成
 
 ```python
+# prompts是问题列表，sampling_params是统一参数；输出是按提交顺序排列的字典列表，不是一个字符串。
 outputs = llm.generate(prompts, sampling_params)
 ```
 
 同一个 `SamplingParams` 对象会被复用于所有 prompt。也可以为每个 prompt 传不同参数：
 
 ```python
+# 构造逐请求参数列表，列表的第i项与prompts第i项配对，应该保持等长。
 params = [
+    # 第一条请求低温、最多输出32token；参数对象与第二条独立。
     SamplingParams(temperature=0.2, max_tokens=32),
+    # 第二条请求使用另一温度和上限，允许同一个GPU batch内不同生成策略。
     SamplingParams(temperature=0.9, max_tokens=128),
 ]
+# 这里params是参数列表，generate不会把它重复扩展；zip按对应位置提交。
 outputs = llm.generate(prompts, params)
 ```
 
@@ -1238,9 +1574,12 @@ outputs = llm.generate(prompts, params)
 ```python
 [
     {
+        # 返回结构示意：字典键text对应解码后的字符串，实际内容来自模型生成ID。
         "text": "生成的文字",
+        # 返回结构示意：这里应是如[40,50]的整数列表；“若干整数”是说明占位，不是有效变量。
         "token_ids": [若干整数],
     },
+    # 省略业务实现或参数的教学占位Ellipsis；不是已实现的完整功能，不可据此直接运行实际推理。
     ...
 ]
 ```
@@ -1252,17 +1591,24 @@ outputs = llm.generate(prompts, params)
 源码位置：[nanovllm/__init__.py](nanovllm/__init__.py)。完整文件只有：
 
 ```python
+# 从nanovllm.llm导入名字LLM；定义LLM薄包装类，实际行为继承LLMEngine。导入名字不等于构造对象。
 from nanovllm.llm import LLM
+# 从nanovllm.sampling_params导入名字SamplingParams；定义每条请求的SamplingParams。导入名字不等于构
+# 造对象。
 from nanovllm.sampling_params import SamplingParams
 ```
 
 它把两个名字暴露给使用者。接着打开 [nanovllm/llm.py](nanovllm/llm.py)：
 
 ```python
+# 从nanovllm.engine.llm_engine导入名字LLMEngine；定义公开生成接口和主循环LLMEngine。导入名字不等于构造对象
+# 。
 from nanovllm.engine.llm_engine import LLMEngine
 
 
+# 定义类LLM，继承LLMEngine的行为；这里只声明对象结构，执行类名(...)才创建实例。
 class LLM(LLMEngine):
+    # 空语句占位；LLM 在这里不重写父类行为，因此沿用 LLMEngine 的构造函数和方法。
     pass
 ```
 
@@ -1271,9 +1617,13 @@ class LLM(LLMEngine):
 现在沿着函数调用进入 [nanovllm/engine/llm_engine.py](nanovllm/engine/llm_engine.py)，在 `generate()` 中找到：
 
 ```python
+# isinstance 检查类型；单个参数对象要扩展成逐请求列表，已有列表则保持不变。
 if not isinstance(sampling_params, list):
+    # 列表乘法重复引用同一个参数对象 len(prompts) 次，不是调用构造函数复制多个对象。
     sampling_params = [sampling_params] * len(prompts)
+# zip 配对输入和参数；prompt 是一个问题，sp 是它的 SamplingParams，长度不等时按较短列表停止。
 for prompt, sp in zip(prompts, sampling_params):
+    # self 是引擎；add_request 编码这一条输入、创建 Sequence 并放进 waiting，尚不执行模型。
     self.add_request(prompt, sp)
 ```
 
@@ -1396,7 +1746,10 @@ flowchart TD
 最核心的循环就在 `LLMEngine.generate`：
 
 ```python
+# self 在此处是 LLMEngine；只要调度器的 waiting/running 尚未都为空，就继续执行一个生成 step。
 while not self.is_finished():
+    # output 是本轮已完成请求的 (seq_id, token_ids) 列表；num_tokens 带正负号，用于区分 Prefill/Decod
+    # e 的吞吐统计。
     output, num_tokens = self.step()
 ```
 
@@ -1405,9 +1758,13 @@ while not self.is_finished():
 下面先用教学伪代码概括；最后一行是中文说明，不是可执行 Python：
 
 ```python
+# 调度器返回本轮请求对象列表 seqs 和批次模式布尔值 is_prefill；不是创建新的请求副本。
 seqs, is_prefill = self.scheduler.schedule()
+# call 接收方法名字字符串及两个参数；最终执行 ModelRunner.run，返回每条请求一个新整数 token。
 token_ids = self.model_runner.call("run", seqs, is_prefill)
+# 把请求列表、对应采样结果和批次模式交给调度器；它更新缓存计数、追加输出并判断结束。
 self.scheduler.postprocess(seqs, token_ids, is_prefill)
+# 中文教学伪代码；真实实现是下面step中的outputs列表推导式，不能直接复制执行。
 收集已完成序列
 ```
 
@@ -1435,12 +1792,19 @@ example.main -> LLMEngine.generate
 源码位置：[llm_engine.py](nanovllm/engine/llm_engine.py)，`LLMEngine.step()`：
 
 ```python
+# 定义引擎单轮执行：self是LLMEngine；无其他入参，返回(本轮完成结果列表,带模式标记的token统计数)。
 def step(self):
+    # 调度器返回本轮请求对象列表 seqs 和批次模式布尔值 is_prefill；不是创建新的请求副本。
     seqs, is_prefill = self.scheduler.schedule()
+    # Prefill 统计本轮计划 token 总数；Decode 每条请求算一个，用负的请求数标记统计类型，不是负长度。
     num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+    # call 接收方法名字字符串及两个参数；最终执行 ModelRunner.run，返回每条请求一个新整数 token。
     token_ids = self.model_runner.call("run", seqs, is_prefill)
+    # 把请求列表、对应采样结果和批次模式交给调度器；它更新缓存计数、追加输出并判断结束。
     self.scheduler.postprocess(seqs, token_ids, is_prefill)
+    # 只选已结束请求，组成二元组列表；未完成请求不会在这个 step 的 outputs 中返回。
     outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+    # 返回两个值，Python 实际打包为 tuple；generate 用两个变量接收。
     return outputs, num_tokens
 ```
 
@@ -1456,17 +1820,24 @@ def step(self):
 源码位置：同一文件的 `LLMEngine.generate()`，先看 while 循环内部的结果收集：
 
 ```python
+# output 是 step 返回的完成列表；循环每次拆出一个请求编号和它的生成 token 列表。
 for seq_id, token_ids in output:
+    # outputs 在这里是结果字典；用请求编号 seq_id 作为键，保存该请求完整的 completion token 列表。
     outputs[seq_id] = token_ids
+    # pbar 是 tqdm 进度条对象；每完成一个请求，计数增加 1，不是每生成一个 token 增加 1。
     pbar.update(1)
 ```
 
 循环全部结束后，继续执行方法尾部：
 
 ```python
+# 所有请求结束后关闭进度条显示；不会删除模型或关闭 Python 进程。
 pbar.close()
+# 此行右边的 outputs 仍是字典；按编号排序取值，再把变量改为列表，恢复原请求顺序。
 outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+# 把每份生成 ID 解码为 text，保留原 token_ids；这次赋值后 outputs 成为字典列表。
 outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+# 返回当前结果列表；这里是完成请求的字典列表，而不是只返回一段文字。
 return outputs
 ```
 
@@ -1514,7 +1885,9 @@ t101 + 历史 KV Cache -> t102
 `ModelRunner` 分别实现：
 
 ```python
+# 方法名示意：真实调用为 self.prepare_prefill(seqs)，把 Prefill 请求打包成模型输入和 Context。
 prepare_prefill(seqs)
+# 方法名示意：真实调用为 self.prepare_decode(seqs)，每条请求只打包 last_token，并提供历史缓存长度。
 prepare_decode(seqs)
 ```
 
@@ -1539,11 +1912,17 @@ Decode  输入 token 4：    缓存新增 4；    采样 token 5
 源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`ModelRunner.prepare_prefill()` 循环内的连续节选：
 
 ```python
+# start 是本条请求已缓存的 token 数，等于本轮新计算片段的起始逻辑位置。
 start = seq.num_cached_tokens
+# seqlen_q 是本轮实际输入的 query token 数；由 Scheduler 设置，不一定等于完整 prompt 长度。
 seqlen_q = seq.num_scheduled_tokens
+# end 是当前片段的右开边界；本轮输入包含 start 到 end-1。
 end = start + seqlen_q
+# Attention 可见 K 的总长度包括已缓存前缀和本轮输入，因此是 end，不只是 seqlen_q。
 seqlen_k = end
+# input_ids 是打包中的 Python 列表；extend 逐个加入这一片段的 ID，seq 切片通过 __getitem__ 取得。
 input_ids.extend(seq[start:end])
+# positions 保存这些 token 在自身请求中的逻辑位置；不同请求各自计数，不是批次扁平数组下标。
 positions.extend(range(start, end))
 ```
 
@@ -1552,9 +1931,13 @@ positions.extend(range(start, end))
 同一文件的 `prepare_decode()` 循环内则是：
 
 ```python
+# Decode 时每条请求只添加上轮新采样的那个 ID；该 token 的 KV 尚需本轮计算。
 input_ids.append(seq.last_token)
+# len(seq) 通过 __len__ 取得当前总 token 数；最后一个位置使用从 0 开始的下标。
 positions.append(len(seq) - 1)
+# context_lens 记录历史加当前 token 的可见长度，给 FlashAttention 读取缓存边界。
 context_lens.append(len(seq))
+# 最后物理块 ID 乘块容量，再加从 0 开始的块内末位置，得到当前 token 的 KV 写入 slot。
 slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
 ```
 
@@ -1583,10 +1966,15 @@ slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_t
 初始化后会执行：
 
 ```python
+# self 此处是 Config；isdir 检查模型路径是否为现有目录，失败时抛 AssertionError。
 assert os.path.isdir(self.model)
+# % 是取余；每块 token 容量必须能被 256 整除，这是当前缓存后端限制。
 assert self.kvcache_block_size % 256 == 0
+# 要求配置的并行 GPU 数在 1 到 8；这条断言本身不检查机器实际有几张 GPU。
 assert 1 <= self.tensor_parallel_size <= 8
+# 读取模型目录配置为 hf_config，包含层数、隐藏维和 dtype 等；不在这一行加载完整权重。
 self.hf_config = AutoConfig.from_pretrained(self.model)
+# 引擎配置上限和模型位置上限取较小值；它不是对每个实际输入请求的长度校验。
 self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
 ```
 
@@ -1604,9 +1992,13 @@ self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddi
 源码位置：[llm_engine.py](nanovllm/engine/llm_engine.py)，`LLMEngine.__init__()` 开头：
 
 ```python
+# fields 读取 dataclass 字段；field 是一个字段描述，name 是字段名；花括号推导式构造集合。
 config_fields = {field.name for field in fields(Config)}
+# kwargs 是引擎收到的关键字字典；k/v 是名字/值；只保留 Config 声明过的名字。
 config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+# model 是目录字符串；** 展开字典为关键字参数；构造 Config 后自动运行 __post_init__。
 config = Config(model, **config_kwargs)
+# 更新类属性，让本进程所有 Sequence 用同一块容量计算逻辑块数量；单位是 token，不是字节。
 Sequence.block_size = config.kvcache_block_size
 ```
 
@@ -1692,16 +2084,25 @@ stateDiagram-v2
 源码位置：[sequence.py](nanovllm/engine/sequence.py)，`Sequence` 的三个 property：
 
 ```python
+# 把下方方法变成属性getter，用obj.name读取就执行；通常不写obj.name()，不自动缓存结果。
 @property
+# 定义只读property：读取当前Sequence的总长度和prompt长度，计算新生成数量；无额外实参。
 def num_completion_tokens(self):
+    # 总 token 数减固定 prompt 长度，得到已生成的 completion 长度。
     return self.num_tokens - self.num_prompt_tokens
 
+# 把下方方法变成属性getter，用obj.name读取就执行；通常不写obj.name()，不自动缓存结果。
 @property
+# 定义只读property：self是Sequence，返回输入部分的ID列表；访问时不要加()。
 def prompt_token_ids(self):
+    # 从列表开头切到原 prompt 边界之前；结果只包含输入部分。
     return self.token_ids[:self.num_prompt_tokens]
 
+# 把下方方法变成属性getter，用obj.name读取就执行；通常不写obj.name()，不自动缓存结果。
 @property
+# 定义只读property：返回Sequence中prompt之后的生成ID列表；不是模型重新生成一份结果。
 def completion_token_ids(self):
+    # 从原 prompt 边界切到列表末尾；结果只包含已生成部分。
     return self.token_ids[self.num_prompt_tokens:]
 ```
 
@@ -1718,16 +2119,25 @@ num_completion_tokens -> 5 - 3 = 2
 块相关属性的真实源码：
 
 ```python
+# 把下方方法变成属性getter，用obj.name读取就执行；通常不写obj.name()，不自动缓存结果。
 @property
+# 定义只读property：由总长度和块容量计算逻辑块数量；不检查物理块是否已经分配。
 def num_blocks(self):
+    # // 是整数除法；对正长度向上取整，算当前总 token 需要几个逻辑块。
     return (self.num_tokens + self.block_size - 1) // self.block_size
 
+# 把下方方法变成属性getter，用obj.name读取就执行；通常不写obj.name()，不自动缓存结果。
 @property
+# 定义只读property：计算最后逻辑块包含多少token，用来定位末token的缓存写入偏移。
 def last_block_num_tokens(self):
+    # 去掉前面完整块的 token 数，得到最后逻辑块里有几个 token。
     return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
+# self是Sequence，i是从0开始的逻辑块索引；返回该块的token ID切片，供BlockManager计算哈希。
 def block(self, i):
+    # i 是从 0 开始的逻辑块编号；断言保证后面的 token 切片编号有效。
     assert 0 <= i < self.num_blocks
+    # 取第 i 个逻辑块覆盖的 token IDs；不是返回物理块编号，也不是 K/V Tensor。
     return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 ```
 
@@ -1749,8 +2159,11 @@ def block(self, i):
 源码位置：[sequence.py](nanovllm/engine/sequence.py)，`Sequence.__getstate__()`：
 
 ```python
+# 定义pickle状态导出方法：self是Sequence；返回固定格式tuple，Prefill/Decode采用不同的末项。
 def __getstate__(self):
+    # 序列化时，Decode 只发送末 token；Prefill/重算需要发送完整 ID 列表。
     last_state = self.last_token if not self.is_prefill else self.token_ids
+    # 按固定顺序打包六项执行状态；__setstate__ 必须按同一顺序拆包，不含完整调度字段。
     return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
 ```
 
@@ -1763,10 +2176,15 @@ Decode 快照把 `token_ids` 设为空列表，只保留 `last_token` 和执行�
 源码位置：[llm_engine.py](nanovllm/engine/llm_engine.py)，完整的 `LLMEngine.add_request()`：
 
 ```python
+# self是引擎；prompt是字符串或整数列表，sampling_params是请求参数对象；副作用为创建请求并入队，隐式返回None。
 def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    # 判断传入的是文字；整数列表跳过编码分支，不能再次把它当字符串编码。
     if isinstance(prompt, str):
+        # 把文字变成配套词表的整数 ID 列表；同名变量 prompt 在此改变了数据类型。
         prompt = self.tokenizer.encode(prompt)
+    # 把已编码的整数列表和采样参数交给构造函数，创建一条真实请求记录。
     seq = Sequence(prompt, sampling_params)
+    # 把这个对象引用交给调度器的 add 方法；不会在此复制 Sequence 或启动 GPU。
     self.scheduler.add(seq)
 ```
 
@@ -1780,18 +2198,31 @@ def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
 打开 [sequence.py](nanovllm/engine/sequence.py)，构造函数的连续节选：
 
 ```python
+# counter 是当前进程共享的迭代计数器；next 取下一个 ID，预热也可能先消耗一些编号。
 self.seq_id = next(Sequence.counter)
+# 给新请求设置枚举状态 WAITING；后续由 Scheduler 改为 RUNNING/FINISHED。
 self.status = SequenceStatus.WAITING
+# copy 复制整数列表，使给 seq 添加输出不会改变调用者原来的输入列表。
 self.token_ids = copy(token_ids)
+# -1 表示列表最后一项；初始化取 prompt 尾 token，空输入会在这里失败。
 self.last_token = token_ids[-1]
+# 保存当前总长度；后续 append_token 每次加 1，使 len(seq) 能快速返回它。
 self.num_tokens = len(self.token_ids)
+# 保存最初输入的固定长度；后续生成不增加它，用作 prompt/completion 分界。
 self.num_prompt_tokens = len(token_ids)
+# 新请求暂时没有自己的缓存；分配、计算和抢占会继续更新这一字段。
 self.num_cached_tokens = 0
+# 初始没有本轮计算计划，Scheduler 调度时再写入；计算结束后会清零。
 self.num_scheduled_tokens = 0
+# 请求初始走 Prefill，通信时需要完整 ID 列表；不是 GPU 已执行的证明。
 self.is_prefill = True
+# 尚未分配物理块；之后 BlockManager 按逻辑顺序填写物理 block ID。
 self.block_table = []
+# 从请求参数复制温度数值，供 prepare_sample 读取并传给 Sampler。
 self.temperature = sampling_params.temperature
+# 复制新生成 token 上限，不包括 prompt；Scheduler 追加输出后检查它。
 self.max_tokens = sampling_params.max_tokens
+# 复制 EOS 策略；False 时遇到 eos 结束，True 时主要依赖生成长度结束。
 self.ignore_eos = sampling_params.ignore_eos
 ```
 
@@ -1808,7 +2239,9 @@ self.ignore_eos = sampling_params.ignore_eos
 源码位置：[scheduler.py](nanovllm/engine/scheduler.py)，`Scheduler.add()`：
 
 ```python
+# self是Scheduler，seq是待提交的Sequence；方法将对象引用放入waiting，隐式返回None。
 def add(self, seq: Sequence):
+    # waiting 是 deque；把同一个请求引用追加到右端，保留提交顺序。
     self.waiting.append(seq)
 ```
 
@@ -1817,13 +2250,20 @@ def add(self, seq: Sequence):
 独立教学示例，不需要安装模型：
 
 ```python
+# 从types导入名字SimpleNamespace；提供SimpleNamespace，创建教学实验的轻量属性对象。导入名字不等于构造对象。
 from types import SimpleNamespace
 
+# SimpleNamespace创建带属性的轻量教学对象，只有num_tokens=3，不是完整Sequence。
 record = SimpleNamespace(num_tokens=3)
+# 普通列表保存record引用；本示例演示引用传递，不是Scheduler的deque实现。
 waiting = [record]
+# 从列表取出的仍是同一对象，赋值并不复制对象内容。
 selected = waiting[0]
+# 经另一个名字修改共享对象字段，record.num_tokens也变成4。
 selected.num_tokens += 1
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(record.num_tokens)       # 4
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(selected is record)      # True
 ```
 
@@ -1834,17 +2274,30 @@ print(selected is record)      # True
 源码位置：[scheduler.py](nanovllm/engine/scheduler.py)，完整 `postprocess()`：
 
 ```python
+# self是Scheduler；seqs是本轮对象列表，token_ids是对应采样整数列表，is_prefill是批次模式；修改对象与队列，返回No
+# ne。
 def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    # seqs 与采样整数列表按相同批次位置配对；一次处理一条请求及一个预测 token。
     for seq, token_id in zip(seqs, token_ids):
+        # 对本轮刚算完的完整缓存块登记链式哈希；不是给未计算的输出 token 建缓存。
         self.block_manager.hash_blocks(seq)
+        # += 把本轮真正处理的 token 数加入已缓存计数；此时还没有追加新预测 token。
         seq.num_cached_tokens += seq.num_scheduled_tokens
+        # 计划已执行，清零后等待下一轮调度重新设置。
         seq.num_scheduled_tokens = 0
+        # Prefill 还有未处理的 token 时，当前 chunk 的末尾不是完整输入末尾，不能追加 completion。
         if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            # 跳过当前 for 循环这一条请求的剩余处理，转去下一条；不是退出整个函数。
             continue
+        # 将模型预测 ID 记录进 Sequence；只更新列表和长度，不会在此执行该 token 的 KV 计算。
         seq.append_token(token_id)
+        # 不忽略 EOS 且生成结束符，或 completion 数达到上限，任一条件成立就结束这条请求。
         if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            # 把这条请求标为已完成；LLMEngine.step 随后通过 is_finished property 收集结果。
             seq.status = SequenceStatus.FINISHED
+            # 释放该请求的缓存块引用，必要时归还 free 队列；同时清空块表和已缓存计数。
             self.block_manager.deallocate(seq)
+            # 从活跃 Decode 队列删除已完成请求；不会删除 seq 中已生成的 token 列表。
             self.running.remove(seq)
 ```
 
@@ -1861,9 +2314,13 @@ def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bo
 打开 [sequence.py](nanovllm/engine/sequence.py)，完整的被调用方法：
 
 ```python
+# self是Sequence，token_id是一个新整数ID；修改列表、last_token和num_tokens，隐式返回None。
 def append_token(self, token_id: int):
+    # append 在整数列表末尾添加一个采样 token；原 prompt 部分保持不变。
     self.token_ids.append(token_id)
+    # 更新末 token，下一轮 prepare_decode 从这里取得输入。
     self.last_token = token_id
+    # 当前总长度增加 1；num_prompt_tokens 不变，所以 completion 长度也增加 1。
     self.num_tokens += 1
 ```
 
@@ -1889,16 +2346,27 @@ def append_token(self, token_id: int):
 在已经装好项目依赖的 WSL 环境中，可以把下面教学脚本保存为临时学习脚本执行；它不创建 LLM、不加载权重、不执行 GPU forward：
 
 ```python
+# 从nanovllm.engine.sequence导入名字Sequence；定义CPU请求记录Sequence。导入名字不等于构造对象。
 from nanovllm.engine.sequence import Sequence
+# 从nanovllm.sampling_params导入名字SamplingParams；定义每条请求的SamplingParams。导入名字不等于构
+# 造对象。
 from nanovllm.sampling_params import SamplingParams
 
+# 假设输入ID，数值只用于手算；不表示三个中文字符或真实tokenizer输出。
 ids = [10, 20, 30]
+# 创建长度3的请求，最多新生成2个token；这里不运行模型，状态初始WAITING。
 seq = Sequence(ids, SamplingParams(max_tokens=2))
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(seq.status.name, len(seq), seq.prompt_token_ids)
+# 人工模拟一次采样结果40，更新token列表和长度；不会自动改变WAITING状态。
 seq.append_token(40)
+# 再模拟追加50，completion长度变2；没有Scheduler参与时仍不会自动判停。
 seq.append_token(50)
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(seq.completion_token_ids, seq.num_completion_tokens)
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(ids)
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(seq.status.name)
 ```
 
@@ -1970,9 +2438,13 @@ prompt 10000 tokens，max_num_batched_tokens=4096
 如果某条序列 Decode 时需要新 block，但没有空闲 block，Scheduler 会抢占某个 running 序列：
 
 ```python
+# 抢占流程的简化写法；真实源码应使用SequenceStatus.WAITING，WAITING不是独立导入名字。
 seq.status = WAITING
+# 抢占后需要按完整token列表重新Prefill，不能继续依赖刚释放的旧KV。
 seq.is_prefill = True
+# 简化写法省略self；真实Scheduler调用self.block_manager，释放该请求缓存并重置计数。
 block_manager.deallocate(seq)
+# 重新放到等待队列左端优先重算；真实源码中waiting为self.waiting。
 waiting.appendleft(seq)
 ```
 
@@ -1996,8 +2468,11 @@ GPU 返回每条序列的一个新 token 后：
 源码位置：[llm_engine.py](nanovllm/engine/llm_engine.py)，`LLMEngine.__init__()` 的连续节选：
 
 ```python
+# 从模型目录加载引擎使用的分词器；use_fast=True 优先使用快速实现。
 self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+# 读取词表定义的结束符整数 ID，填入配置；不是字符串 "<eos>"。
 config.eos = self.tokenizer.eos_token_id
+# 根据已补全的缓存容量和 EOS 配置创建调度器，并保存在引擎成员中。
 self.scheduler = Scheduler(config)
 ```
 
@@ -2006,8 +2481,11 @@ self.scheduler = Scheduler(config)
 源码位置：[scheduler.py](nanovllm/engine/scheduler.py)，`Scheduler.__init__()` 尾部：
 
 ```python
+# 按物理块数和每块 token 数创建 CPU 元数据管理器；它本身不分配 GPU K/V Tensor。
 self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+# 创建等待队列；冒号后的类型标注表示里面预期存 Sequence，运行时不会自动逐项强制检查。
 self.waiting: deque[Sequence] = deque()
+# 创建可 Decode 的活跃队列；不是保存模型 Tensor 的 GPU batch。
 self.running: deque[Sequence] = deque()
 ```
 
@@ -2018,12 +2496,19 @@ self.running: deque[Sequence] = deque()
 源码位置：同一文件的 `Scheduler.schedule()`，以下是设置本轮预算和转移队列的连续节选：
 
 ```python
+# num_tokens 是这条请求仍需处理量，remaining 是本轮剩余 token 预算；取较小值支持分段 Prefill。
 seq.num_scheduled_tokens = min(num_tokens, remaining)
+# 增加本轮 Prefill 批次的累计计划数，后续请求只能使用剩余预算。
 num_batched_tokens += seq.num_scheduled_tokens
+# 检查这次计划能否覆盖当前请求全部未计算 token；此刻只是安排，还没执行 GPU。
 if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+    # 将最后一段 Prefill 的请求提前标为 RUNNING，方便同步执行之后进入 Decode。
     seq.status = SequenceStatus.RUNNING
+    # popleft 删除并取出等待队列左端；该请求此后不再留在 waiting。
     self.waiting.popleft()
+    # 把已安排最后一段 Prefill 的同一个对象加入 running，供后续 Decode 调度。
     self.running.append(seq)
+# 将请求加入本轮执行列表，Runner 按列表顺序构造 Tensor 和返回采样结果。
 scheduled_seqs.append(seq)
 ```
 
@@ -2043,17 +2528,29 @@ scheduled_seqs.append(seq)
 源码位置：同一文件的 `schedule()`，Decode 循环内：
 
 ```python
+# 取出当前活跃队列最左侧请求，准备检查它能否执行一次 Decode。
 seq = self.running.popleft()
+# can_append 查询是否有空间保存本轮 token 的 KV；空间不足时循环尝试抢占释放资源。
 while not self.block_manager.can_append(seq):
+    # 非空队列作为条件为 True；说明除了当前 seq 还有其他可被抢占的请求。
     if self.running:
+        # pop 从队列右端取出另一条请求，preempt 释放它的缓存并放回 waiting。
         self.preempt(self.running.pop())
+    # 与同缩进层的条件分支配对；前面条件不成立时执行这里的替代路径。
     else:
+        # 没有其他请求可释放时只能抢占当前请求，使其回到等待重算状态。
         self.preempt(seq)
+        # 退出最近的一层循环；在 Decode 的 while 中使用时也阻止执行该 while 的 else 分支。
         break
+# 此else与while配对：循环未因break退出、条件正常变假时才执行，不是if的else。
 else:
+    # Decode 每条请求本轮只处理一个输入 token；不是整个批次只计算一个。
     seq.num_scheduled_tokens = 1
+    # 切到 Decode 通信快照模式，后续 pickle 只需传 last_token 和缓存元数据。
     seq.is_prefill = False
+    # 若当前末 token 已进入新逻辑块，则分配一个新物理块并更新 block_table。
     self.block_manager.may_append(seq)
+    # 将请求加入本轮执行列表，Runner 按列表顺序构造 Tensor 和返回采样结果。
     scheduled_seqs.append(seq)
 ```
 
@@ -2071,7 +2568,9 @@ else:
 源码位置：同一文件的 `Scheduler.is_finished()`：
 
 ```python
+# 定义调度器普通实例方法：self是Scheduler，无额外实参，返回waiting/running是否同时为空。
 def is_finished(self):
+    # 两条队列都空才返回 True；一条请求完成不等于整个引擎已完成。
     return not self.waiting and not self.running
 ```
 
@@ -2098,6 +2597,7 @@ Paged KV Cache 借鉴操作系统分页：
 序列只保存：
 
 ```python
+# 教学块表：第 0/1/2 个逻辑块分别映射到物理块 17/3/29；数字不是 token ID，物理块也不必连续。
 block_table = [17, 3, 29]
 ```
 
@@ -2108,9 +2608,13 @@ block_table = [17, 3, 29]
 `Block` 的元数据位于 CPU：
 
 ```python
+# CPU元数据字段：物理块编号，链接到GPU缓存位置，不是逻辑token下标。
 block_id    # 物理块编号
+# CPU元数据字段：当前活跃请求引用数量，归零才可归还空闲队列。
 ref_count   # 有多少序列正在引用
+# CPU元数据字段：完整前缀的链式哈希，用于缓存查询；不是Python内置hash函数的调用。
 hash        # 该完整 token block 的链式哈希
+# 此处是Block存的完整块内容ID列表，用于核对哈希命中；与Sequence全序列token_ids范围不同。
 token_ids   # 用于防止哈希碰撞误命中
 ```
 
@@ -2127,7 +2631,9 @@ token_ids   # 用于防止哈希碰撞误命中
 第一维的 `2` 分别代表 K 和 V。每个 Attention 层得到属于自己的切片：
 
 ```python
+# self 是 Runner，module 是当前 Attention；第一维 0 选择 K、layer_id 选择模型层，取得共享存储切片。
 module.k_cache = self.kv_cache[0, layer_id]
+# 第一维 1 选择 V，绑定到同一层 Attention 的 v_cache；不是为该请求另复制一份完整缓存。
 module.v_cache = self.kv_cache[1, layer_id]
 ```
 
@@ -2219,9 +2725,13 @@ B 可以复用 A 的前两个完整 block，但必须为 `[10,11]` 所在的尾�
 源码位置：[block_manager.py](nanovllm/engine/block_manager.py)，构造函数节选：
 
 ```python
+# 为每个物理块 ID 建一个 CPU 元数据对象；num_blocks 是总块数量，i 从 0 开始。
 self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+# 创建哈希到物理块 ID 的查询表；键和值都是整数，内容由 hash_blocks 后续填入。
 self.hash_to_block_id: dict[int, int] = dict()
+# 初始化空闲 ID 队列，所有物理块开始都可以分配；不是装有 KV 数值的队列。
 self.free_block_ids: deque[int] = deque(range(num_blocks))
+# 空集合记录当前被请求引用的物理块；set 适合快速判断某个 ID 是否正在使用。
 self.used_block_ids: set[int] = set()
 ```
 
@@ -2242,8 +2752,11 @@ self.used_block_ids: set[int] = set()
 源码位置：[block_manager.py](nanovllm/engine/block_manager.py)，`allocate()` 尾部：
 
 ```python
+# 跳过已经命中的前缀块，对剩余逻辑块逐一分配；范围不包含右端 seq.num_blocks。
 for i in range(num_cached_blocks, seq.num_blocks):
+    # _allocate_block 取空闲物理 ID 并重置元数据，再按逻辑顺序加入该请求块表。
     seq.block_table.append(self._allocate_block())
+# 命中的块数乘每块 token 容量，得到已可复用的前缀 token 数，减少后续 Prefill 计算。
 seq.num_cached_tokens = num_cached_blocks * self.block_size
 ```
 
@@ -2256,14 +2769,23 @@ seq.num_cached_tokens = num_cached_blocks * self.block_size
 源码位置：同一文件的 `can_allocate()`，连续节选：
 
 ```python
+# 只查询最后一个逻辑块之前的前缀；即使尾块恰好完整，也保留它用于当前预测。
 for i in range(seq.num_blocks - 1):
+    # 取第 i 个逻辑块的整数 ID 列表，用于哈希和碰撞校验；不是读取 GPU 缓存。
     token_ids = seq.block(i)
+    # 将本块内容及此前前缀哈希计算成新哈希 h，保证缓存匹配的是整个连续前缀。
     h = self.compute_hash(token_ids, h)
+    # dict.get 用 h 查询物理块编号；没找到时返回默认值 -1，而不是触发 KeyError。
     block_id = self.hash_to_block_id.get(h, -1)
+    # 没有哈希匹配或实际 ID 列表不同，都不能复用；or 的短路防止用 -1 误读取末块。
     if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+        # 退出最近的一层循环；在 Decode 的 while 中使用时也阻止执行该 while 的 else 分支。
         break
+    # 找到一个连续匹配的完整前缀块，缓存命中计数增加 1。
     num_cached_blocks += 1
+    # 判断命中块是否已由其他活跃请求引用；已使用块可共享，不再占用一个新 free ID。
     if block_id in self.used_block_ids:
+        # 对正在使用的共享命中块，减少需要从 free 队列取出的块数量。
         num_new_blocks -= 1
 ```
 
@@ -2278,13 +2800,21 @@ for i in range(seq.num_blocks - 1):
 源码位置：同一文件的完整 `deallocate()`：
 
 ```python
+# self是BlockManager，seq是待释放请求；归还缓存引用并清空该请求映射，返回None。
 def deallocate(self, seq: Sequence):
+    # 从请求尾部向前遍历所引用的物理 ID；reversed 改变遍历顺序，不修改原块表。
     for block_id in reversed(seq.block_table):
+        # 按物理编号取得 CPU Block 元数据，包括 ref_count/hash/token_ids。
         block = self.blocks[block_id]
+        # 当前请求不再引用这个物理块，引用计数减一；其他请求仍可能使用它。
         block.ref_count -= 1
+        # 只有没有活跃引用时才真正归还空闲队列，避免覆盖其他请求需要的缓存。
         if block.ref_count == 0:
+            # 内部方法把 ID 从 used 集合移到 free 队列；旧完整块哈希可暂时保留以备复用。
             self._deallocate_block(block_id)
+    # 当前请求已释放全部 KV 引用，所以缓存计数归零；prompt/completion token 列表仍保留。
     seq.num_cached_tokens = 0
+    # clear 原地清空该请求映射；不是销毁 Runner 的整个 GPU KV 大 Tensor。
     seq.block_table.clear()
 ```
 
@@ -2320,6 +2850,7 @@ def deallocate(self, seq: Sequence):
 核心计算为：
 
 ```python
+# 中文公式伪代码：预算字节数除每物理块字节数并取整，得到可分配块数量，不可直接当Python运行。
 num_blocks = 可用于 KV Cache 的字节数 // 单个 block 字节数
 ```
 
@@ -2367,6 +2898,7 @@ block_tables   = [每条序列的物理块表]
 `utils/context.py` 保存当前 forward 的临时元数据。这样 Qwen3 的每一层只需接收：
 
 ```python
+# 参数名字示意：分别是整数ID和逻辑位置Tensor；这一行仅列名字，不执行网络。
 input_ids, positions
 ```
 
@@ -2394,10 +2926,15 @@ prepare_prefill/decode
 源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，完整 `ModelRunner.call()`：
 
 ```python
+# self是Runner，method_name是方法名字字符串，*args收集它的实参；找到方法并执行，返回被调用方法的结果。
 def call(self, method_name, *args):
+    # self为Runner，只有多卡rank0需要广播控制消息；单卡或worker不执行write_shm分支。
     if self.world_size > 1 and self.rank == 0:
+        # 多卡 rank 0 把方法名和参数 pickle 到共享内存，再用 Event 通知工作进程执行。
         self.write_shm(method_name, *args)
+    # 根据字符串从当前 Runner 取方法对象，例如 "run"；不存在时得到 None，当前实现没有专门错误检查。
     method = getattr(self, method_name, None)
+    # *args 将收集的参数展开给被找到的方法，返回它的执行结果；不是返回函数对象本身。
     return method(*args)
 ```
 
@@ -2410,12 +2947,19 @@ def call(self, method_name, *args):
 源码位置：同一文件的 `ModelRunner.run()`：
 
 ```python
+# self是Runner；seqs是本轮请求列表，is_prefill决定输入路径；rank0返回list[int]，worker实际返回None。
 def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    # 先按批次模式整理请求，得到两个 GPU 整数 Tensor；prepare 同时设置本轮 Context。
     input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    # 只有 rank 0 打包每条请求的温度为 [B] Tensor，非零 rank 不采样所以使用 None。
     temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+    # 执行模型和 LM Head；rank 0 得到按请求排列的词表分数 [B,V]。
     logits = self.run_model(input_ids, positions, is_prefill)
+    # rank 0 抽样得到 [B] 整数 Tensor，再转成 Python 列表；这个转换需要读取 GPU 结果。
     token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+    # 清除当前进程的临时执行元数据，避免下一轮误用旧边界/模式；不是释放 KV 缓存。
     reset_context()
+    # rank0返回本轮采样整数列表，非零rank为None；Runner不把ID解码成文字。
     return token_ids
 ```
 
@@ -2441,9 +2985,13 @@ cu_seqlens_k    [0, 3, 5]             无历史缓存时与 Q 边界一致
 连续节选，位于同一文件 `prepare_prefill()` 的循环内：
 
 ```python
+# 上一个累计 Q 边界加当前输入长度，追加新的边界；例如长度 3、2 得到 [0,3,5]。
 cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+# 累计每条请求可见 K 长度；有缓存前缀时与 Q 边界不同，不等于当前输入 Tensor 中的旧 K/V。
 cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+# 更新本轮最大输入 Q 长度，FlashAttention 用它选择计算所需的长度上界。
 max_seqlen_q = max(seqlen_q, max_seqlen_q)
+# 更新本轮最大可见 K 长度，包含历史缓存前缀和本轮新输入。
 max_seqlen_k = max(seqlen_k, max_seqlen_k)
 ```
 
@@ -2468,12 +3016,19 @@ max_seqlen_k = max(seqlen_k, max_seqlen_k)
 源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`allocate_kv_cache()` 尾部：
 
 ```python
+# 创建 [K/V,层,物理块,块内token,每卡KV头,头维度] 的大 Tensor；默认设备/精度在初始化中已设为 GPU/模型 dtype。
 self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+# layer_id 是遍历 Attention 层时的缓存层索引，从 0 开始，不是 GPU rank。
 layer_id = 0
+# 遍历 Qwen3 及其子模块；modules() 包含多种层，不仅是 Attention。
 for module in self.model.modules():
+    # 找同时带有 K/V 缓存字段的模块，即本项目底层 Attention；hasattr 检查属性是否存在。
     if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+        # self 是 Runner，module 是当前 Attention；第一维 0 选择 K、layer_id 选择模型层，取得共享存储切片。
         module.k_cache = self.kv_cache[0, layer_id]
+        # 第一维 1 选择 V，绑定到同一层 Attention 的 v_cache；不是为该请求另复制一份完整缓存。
         module.v_cache = self.kv_cache[1, layer_id]
+        # 当前 Attention 绑定好缓存后，下一 Attention 使用下一层切片。
         layer_id += 1
 ```
 
@@ -2517,7 +3072,9 @@ flowchart LR
 ### 15.2 Attention 投影
 
 ```python
+# self 此处是 Qwen3Attention；将 [T,H] 隐藏向量一次投影为合并的 Q/K/V 特征。
 qkv = self.qkv_proj(hidden_states)
+# 省略参数的示意；真实代码指定Q/K/V各自宽度与dim=-1，不能用Ellipsis直接完成正确切分。
 q, k, v = qkv.split(...)
 ```
 
@@ -2555,6 +3112,7 @@ up   = x W_up
 Prefill 对每条序列只取最后一个 query token 的 hidden state：
 
 ```python
+# 删除累计边界开头的 0，再逐项减 1，得到每条请求本轮最后一个 query 的扁平数组下标。
 last_indices = context.cu_seqlens_q[1:] - 1
 ```
 
@@ -2565,8 +3123,11 @@ last_indices = context.cu_seqlens_q[1:] - 1
 源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`ModelRunner.__init__()` 节选：
 
 ```python
+# self 此处是 Runner；根据模型配置建立 Qwen3 网络结构与参数容器，还需要后面的权重加载。
 self.model = Qwen3ForCausalLM(hf_config)
+# 第一个参数是网络对象，第二个是本地权重目录；函数把 safetensors 数值复制到网络参数。
 load_model(self.model, config.model)
+# 创建并保存温度采样模块；之后对象调用进入 Sampler.forward，而不是构造函数。
 self.sampler = Sampler()
 ```
 
@@ -2575,6 +3136,7 @@ self.sampler = Sampler()
 执行入口在同一文件的 `run_model()`，正常执行分支是：
 
 ```python
+# 内层先计算 hidden states，外层 LM Head 再计算 logits；此处不会直接得到文本或 token ID。
 return self.model.compute_logits(self.model(input_ids, positions))
 ```
 
@@ -2585,6 +3147,7 @@ return self.model.compute_logits(self.model(input_ids, positions))
 源码位置：[qwen3.py](nanovllm/models/qwen3.py)，`Qwen3ForCausalLM.forward()` 的函数体：
 
 ```python
+# self 此处是 Qwen3ForCausalLM；内部 self.model 是 Qwen3Model，返回 Transformer 隐藏向量。
 return self.model(input_ids, positions)
 ```
 
@@ -2593,11 +3156,17 @@ return self.model(input_ids, positions)
 继续进入同一文件的 `Qwen3Model.forward()`，连续函数体：
 
 ```python
+# 对整数 ID 查 embedding 权重表，形状由 [T] 变成 [T,H]；不是进行 tokenizer 编码。
 hidden_states = self.embed_tokens(input_ids)
+# 第一个 Decoder Layer 尚未收到累积残差，用 None 让它选择首次处理分支。
 residual = None
+# layers 是 ModuleList；依次运行配置指定数量的 Decoder Layer，同一批 token 经过每一层。
 for layer in self.layers:
+    # 调用当前层 forward，输入位置/主分支/残差，接收更新后的两路 Tensor。
     hidden_states, residual = layer(positions, hidden_states, residual)
+# 最后合并 MLP 输出与残差并归一化；第二个返回值不再需要，用变量名 _ 接收。
 hidden_states, _ = self.norm(hidden_states, residual)
+# 把Transformer最后的隐藏向量交给调用者，后续还需LM Head投影。
 return hidden_states
 ```
 
@@ -2613,13 +3182,21 @@ return hidden_states
 源码位置：同一文件 `Qwen3DecoderLayer.forward()` 的函数体：
 
 ```python
+# 首层没有旧残差时选首次路径；None 检查使用 is，不是张量数值比较。
 if residual is None:
+    # 同时赋值先计算右侧：归一化原输入作为主分支，并将原输入保存成 residual。
     hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+# 与同缩进层的条件分支配对；前面条件不成立时执行这里的替代路径。
 else:
+    # 后续层调用融合版本，先将上一层输出加残差，再 RMSNorm，返回新主分支与累积残差。
     hidden_states, residual = self.input_layernorm(hidden_states, residual)
+# self_attn 是 Qwen3Attention；当前归一化向量和位置进入 QKV、RoPE、缓存注意力及输出投影。
 hidden_states = self.self_attn(positions, hidden_states)
+# Attention 输出与残差相加并归一化，更新两路值，给 MLP 提供输入。
 hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+# mlp 是 Qwen3MLP；执行 Gate/Up 合并投影、SiLU乘法和 Down 投影，残差加法留到下个 Norm。
 hidden_states = self.mlp(hidden_states)
+# 返回主分支和残差两个 Tensor；调用者必须继续传递 residual，不能只看主分支就判断模型少了残差。
 return hidden_states, residual
 ```
 
@@ -2671,7 +3248,9 @@ x = RMSNorm(x)
 `SiluAndMul` 做：
 
 ```python
+# 沿最后一维拆成 Gate(x) 与 Up(y) 两半；多重赋值右侧使用的是拆分前的 x。
 x, y = x.chunk(2, -1)
+# 数学写法示意，silu 实际来自 F.silu；逐元素门控，不是矩阵乘法。
 return silu(x) * y
 ```
 
@@ -2682,12 +3261,14 @@ return silu(x) * y
 Prefill：
 
 ```python
+# Prefill函数名示意，省略实际Q/K/V及边界参数；causal=True禁止注意当前位置之后的token。
 flash_attn_varlen_func(..., causal=True)
 ```
 
 Decode：
 
 ```python
+# Decode函数名示意，历史长度和块表告诉库从哪些物理缓存块读取上下文；省略值不可直接执行。
 flash_attn_with_kvcache(..., cache_seqlens=..., block_table=...)
 ```
 
@@ -2698,17 +3279,29 @@ flash_attn_with_kvcache(..., cache_seqlens=..., block_table=...)
 定义与构造都在 [qwen3.py](nanovllm/models/qwen3.py) 的 `Qwen3Attention` 中；它持有投影层、RoPE、内部 `Attention` 模块。其 `forward()` 连续节选：
 
 ```python
+# self 此处是 Qwen3Attention；将 [T,H] 隐藏向量一次投影为合并的 Q/K/V 特征。
 qkv = self.qkv_proj(hidden_states)
+# 按最后一维分成 Q、K、V 三段；Q 段宽 q_size，K/V 各宽 kv_size，GQA 下三段不一定等宽。
 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+# Q 改形状为 [T,每卡Q头数,头维度]；-1 让 PyTorch 根据元素总数推断 T。
 q = q.view(-1, self.num_heads, self.head_dim)
+# K 改形状为 [T,每卡KV头数,头维度]，头数可能小于 Q。
 k = k.view(-1, self.num_kv_heads, self.head_dim)
+# V 采用与 K 相同的 head 形状；view 不重新计算特征值。
 v = v.view(-1, self.num_kv_heads, self.head_dim)
+# 依据该模型实现的配置分支，未使用 QKV bias 时对 Q/K 额外做 RMSNorm。
 if not self.qkv_bias:
+    # q_norm 是 RMSNorm 模块对象；调用其 forward，沿每个 Q head 的最后一维归一化。
     q = self.q_norm(q)
+    # 对每个 K head 做同类归一化；这里没有对 V 做这一操作。
     k = self.k_norm(k)
+# positions 提供每个 token 的逻辑位置，RoPE 查 cos/sin 表并旋转 Q/K，返回两个更新后的 Tensor。
 q, k = self.rotary_emb(positions, q, k)
+# 进入底层 Attention.forward，先写入本轮 KV，再用 FlashAttention 计算输出 o。
 o = self.attn(q, k, v)
+# flatten 合并除 token 维外的 head 相关维；o_proj 将多头结果投影回 hidden_size，TP 时汇总部分和。
 output = self.o_proj(o.flatten(1, -1))
+# 把Attention投影后的隐藏向量返回上一层；不是用户最终Completion文字。
 return output
 ```
 
@@ -2729,9 +3322,13 @@ return output
 源码位置：[attention.py](nanovllm/layers/attention.py)，`Attention.forward()` 开头：
 
 ```python
+# 读取当前进程 Runner 设置的 Context，包含模式、长度边界和物理块映射；不是每条请求独有的新对象。
 context = get_context()
+# self 此处是底层 Attention；取得绑定到这一模型层的 GPU K/V 缓存切片。
 k_cache, v_cache = self.k_cache, self.v_cache
+# numel 返回元素总数；只有两份缓存都非空才写缓存，初始化预热时空缓存会跳过。
 if k_cache.numel() and v_cache.numel():
+    # 将本轮 K/V 向量按 slot_mapping 写入当前层缓存；参数分别为新K、新V、K缓存、V缓存、目标slot表。
     store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 ```
 
@@ -2746,15 +3343,25 @@ if k_cache.numel() and v_cache.numel():
 源码位置：同一文件 `store_kvcache_kernel()` 的连续节选：
 
 ```python
+# Triton 第 0 维 program 编号，本 kernel 让一个 program 处理本轮一个 token 的 KV 向量。
 idx = tl.program_id(0)
+# 从 GPU 指针读取第 idx 个 token 的目标物理 slot；加 idx 是地址偏移，不是 Python 列表切片。
 slot = tl.load(slot_mapping_ptr + idx)
+# slot 为 -1 表示 padding/无效 token，该 GPU program 立即停止，不向缓存写入。
 if slot == -1: return
+# key_stride 是相邻 token 起点的元素距离；加 [0,D) 得到本 token 所有 KV-head 元素的地址偏移。
 key_offsets = idx * key_stride + tl.arange(0, D)
+# 按 Value 的实际 token 步长形成读取偏移；不能假定它与 Key 的 stride 永远相同。
 value_offsets = idx * value_stride + tl.arange(0, D)
+# 从当前 token 的 K 指针位置载入 D 个元素到 kernel 的工作值。
 key = tl.load(key_ptr + key_offsets)
+# 同样读取本 token 的 D 个 V 元素，不是读取 token ID。
 value = tl.load(value_ptr + value_offsets)
+# 缓存按物理 slot 展开；一个 slot 占 D 个元素，这里形成完整向量的写入偏移。
 cache_offsets = slot * D + tl.arange(0, D)
+# 将 K 向量写到目标物理 slot 对应的当前层 K 缓存位置。
 tl.store(k_cache_ptr + cache_offsets, key)
+# 将 V 向量写入同一个 slot 的 V 缓存，保持两份缓存位置一致。
 tl.store(v_cache_ptr + cache_offsets, value)
 ```
 
@@ -2767,9 +3374,13 @@ tl.store(v_cache_ptr + cache_offsets, value)
 源码位置：[rotary_embedding.py](nanovllm/layers/rotary_embedding.py)，`apply_rotary_emb()` 函数体：
 
 ```python
+# RoPE 先用 FP32 计算，再沿 head 最后一维分成两半；配对的是两半中的相同索引。
 x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+# 旋转后第一半；cos/sin 来自位置查表，会广播到每个 attention head。
 y1 = x1 * cos - x2 * sin
+# 旋转后第二半，使用同一组角度，与上一行组成二维旋转。
 y2 = x2 * cos + x1 * sin
+# 沿最后一维重新拼成原 head 宽度，并转换回输入 x 的精度；不是改变 token 顺序。
 return torch.cat((y1, y2), dim=-1).to(x.dtype)
 ```
 
@@ -2778,11 +3389,17 @@ return torch.cat((y1, y2), dim=-1).to(x.dtype)
 源码位置：[layernorm.py](nanovllm/layers/layernorm.py)，`RMSNorm.rms_forward()` 函数体：
 
 ```python
+# 保存输入精度，RMSNorm 的中间计算用 FP32，输出还要转换回来。
 orig_dtype = x.dtype
+# 将工作 Tensor 转为 float32 以提高平方均值计算稳定性；不是把它移到 CPU。
 x = x.float()
+# pow(2) 逐元素平方，沿最后一维求平均；keepdim 保留长度 1 的维度以便广播，var 实际是平方均值。
 var = x.pow(2).mean(dim=-1, keepdim=True)
+# eps 是避免零分母的微小常数；rsqrt 是平方根倒数；mul_ 原地缩放每个输入元素。
 x.mul_(torch.rsqrt(var + self.eps))
+# 恢复原精度再乘训练得到的 Norm 权重；to 是精度转换，mul_ 是原地乘法。
 x = x.to(orig_dtype).mul_(self.weight)
+# 返回当前计算Tensor，含义由所在Norm/MLP函数决定，不是将变量打印出来。
 return x
 ```
 
@@ -2795,17 +3412,24 @@ return x
 源码位置：[qwen3.py](nanovllm/models/qwen3.py)，完整 `Qwen3MLP.forward()`：
 
 ```python
+# 定义Qwen3MLP前向：x是[T,H]隐藏向量，self是MLP实例；返回同样[T,H]的输出Tensor。
 def forward(self, x):
+    # MLP 一次合并投影产生 Gate 和 Up 两路，中间形状为 [T,2I/TP]。
     gate_up = self.gate_up_proj(x)
+    # act_fn 是 SiluAndMul，将合并输出分两半后执行 SiLU(gate)*up，宽度减半。
     x = self.act_fn(gate_up)
+    # Down 投影从每卡中间维回到 hidden_size，多卡时 RowParallelLinear 再 all-reduce。
     x = self.down_proj(x)
+    # 返回当前计算Tensor，含义由所在Norm/MLP函数决定，不是将变量打印出来。
     return x
 ```
 
 `self.act_fn` 在该类构造函数中创建为 `SiluAndMul()`，所以第二行进入 [activation.py](nanovllm/layers/activation.py)：
 
 ```python
+# 沿最后一维拆成 Gate(x) 与 Up(y) 两半；多重赋值右侧使用的是拆分前的 x。
 x, y = x.chunk(2, -1)
+# F 是 torch.nn.functional；SiLU(x)=x*sigmoid(x)，再与 Up 分支 y 逐元素相乘。
 return F.silu(x) * y
 ```
 
@@ -2830,7 +3454,9 @@ logits = hidden_states × embedding_weightᵀ
 源码先执行：
 
 ```python
+# 数学简化：用同一温度缩放分数；真实batch代码对每条请求的[B,1]温度广播。
 logits = logits / temperature
+# 数学简化，真实调用为torch.softmax(logits, dim=-1)，沿词表维转换为概率。
 probs = softmax(logits)
 ```
 
@@ -2843,8 +3469,11 @@ probs = softmax(logits)
 采样器使用 exponential race 技巧：
 
 ```python
+# 开始数学采样表达式；这里省略具体Torch随机Tensor构造，不是独立完整脚本。
 sample_tokens = (
+    # 概念上为每个候选用独立指数随机数缩放概率；真实实现一次生成与probs同形状的随机Tensor。
     probs / Exponential(1).sample()
+# 对缩放后的随机分数沿词表维取最大下标；它并非直接对原logits做greedy。
 ).argmax(dim=-1)
 ```
 
@@ -2855,6 +3484,7 @@ sample_tokens = (
 `SamplingParams.__post_init__` 明确断言：
 
 ```python
+# 布尔条件示意，真实SamplingParams.__post_init__用assert强制检查。
 temperature > 1e-10
 ```
 
@@ -2865,10 +3495,15 @@ temperature > 1e-10
 源码位置：[embed_head.py](nanovllm/layers/embed_head.py)，`ParallelLMHead.forward()` 开头：
 
 ```python
+# 读取当前进程 Runner 设置的 Context，包含模式、长度边界和物理块映射；不是每条请求独有的新对象。
 context = get_context()
+# LM Head 在 Prefill 只选每条请求的末 query；Decode 本身每条请求只有一行。
 if context.is_prefill:
+    # 删除累计边界开头的 0，再逐项减 1，得到每条请求本轮最后一个 query 的扁平数组下标。
     last_indices = context.cu_seqlens_q[1:] - 1
+    # 根据末 token 下标取 hidden states；contiguous 使结果存储连续，便于后续线性计算。
     x = x[last_indices].contiguous()
+# 计算 x乘weight转置；x=[B,H]，head权重=[V/TP,H]，每卡得 [B,V/TP] 词表分数。
 logits = F.linear(x, self.weight)
 ```
 
@@ -2890,11 +3525,18 @@ last_indices = [3,5] - 1 = [2,4]
 源码位置：[sampler.py](nanovllm/layers/sampler.py)，完整 `Sampler.forward()`：
 
 ```python
+# 让PyTorch为下方计算建立编译路径，首次可能触发编译；与Runner的enforce_eager图开关不是同一个机制。
 @torch.compile
+# 定义Sampler前向：logits为[B,V]词表分数，temperatures为[B]逐请求温度；返回[B]整数采样ID，self是Sample
+# r实例。
 def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
+    # logits 转 FP32；[B] 温度增加第1维变 [B,1]，广播到各请求的所有词表分数并原地相除。
     logits = logits.float().div_(temperatures.unsqueeze(dim=1))
+    # 在最后的词表维归一化为概率，每条请求的一行概率和约为 1。
     probs = torch.softmax(logits, dim=-1)
+    # 创建同形状指数随机数，限制极小分母，再用概率除以随机数并沿词表取最大位置；得到 [B] 随机采样 ID。
     sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
+    # 返回每条请求一个整数ID的Tensor；Runner下一步调用tolist转成Python列表。
     return sample_tokens
 ```
 
@@ -2914,8 +3556,12 @@ def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
 `utils/loader.py` 遍历模型目录下所有 `*.safetensors`：
 
 ```python
+# path 是模型目录；join 构造文件匹配模式，glob 找到该目录顶层所有 safetensors 文件，逐文件读取。
 for file in glob(os.path.join(path, "*.safetensors")):
+    # file 是权重文件路径，"pt" 表示 PyTorch Tensor，"cpu" 表示先读到 CPU；f 是提供 keys/get_tensor
+    # 的读取对象。
     with safe_open(file, "pt", "cpu") as f:
+        # 省略业务实现或参数的教学占位Ellipsis；不是已实现的完整功能，不可据此直接运行实际推理。
         ...
 ```
 
@@ -2926,11 +3572,17 @@ for file in glob(os.path.join(path, "*.safetensors")):
 Qwen3 声明：
 
 ```python
+# 映射表把 checkpoint 的独立权重名对应到运行时合并模块名，并提供写入哪一段的 shard_id。
 packed_modules_mapping = {
+    # checkpoint 的 Q 投影写入运行时 qkv_proj 的 Q 段；"q" 是分段标签，不是实际 Query Tensor。
     "q_proj": ("qkv_proj", "q"),
+    # 独立 K 投影写入同一 qkv_proj 的 K 段，保持模型计算的合并布局。
     "k_proj": ("qkv_proj", "k"),
+    # 独立 V 投影写入 qkv_proj 的 V 段，与 Q/K 放在同一参数容器中。
     "v_proj": ("qkv_proj", "v"),
+    # Gate 权重写入合并 Gate-Up 参数的第 0 段；0 是分段编号，不是 GPU rank。
     "gate_proj": ("gate_up_proj", 0),
+    # Up 权重写入 Gate-Up 参数第 1 段，与 Gate 区分目标区间。
     "up_proj": ("gate_up_proj", 1),
 }
 ```
@@ -2974,10 +3626,16 @@ LLMEngine.__init__
 源码位置：[loader.py](nanovllm/utils/loader.py)，`load_model()` 中处理合并权重的连续节选：
 
 ```python
+# k 是匹配到的权重名片段；v 在这里是目标模块名字字符串，shard_id 是分段标签，别与 Attention 的 Value Tensor 混淆
+# 。
 v, shard_id = packed_modules_mapping[k]
+# 将 checkpoint 名字中的原模块片段替换成合并模块名，得到运行时参数的完整路径。
 param_name = weight_name.replace(k, v)
+# 沿模型属性路径取得已构造好的 nn.Parameter；找不到表示命名/模型架构不匹配。
 param = model.get_parameter(param_name)
+# 取挂在目标 Parameter 上的自定义加载方法；这个变量保存的是可调用方法对象，不是权重数值。
 weight_loader = getattr(param, "weight_loader")
+# 参数依次是目标Parameter、文件里的原权重Tensor、合并分段标签；loader 切出本 rank 分片并复制到正确区间。
 weight_loader(param, f.get_tensor(weight_name), shard_id)
 ```
 
@@ -2996,7 +3654,9 @@ weight_loader(param, f.get_tensor(weight_name), shard_id)
 源码位置：[linear.py](nanovllm/layers/linear.py)，`LinearBase.__init__()` 中：
 
 ```python
+# output_size是输出宽度，input_size是输入宽度；empty只分配未初始化存储，Parameter把它登记为模型参数。
 self.weight = nn.Parameter(torch.empty(output_size, input_size))
+# self 是线性层；把该层的加载方法挂到 weight 参数上，让通用 loader 能动态调用正确分片规则。
 self.weight.weight_loader = self.weight_loader
 ```
 
@@ -3005,7 +3665,9 @@ self.weight.weight_loader = self.weight_loader
 普通没有自定义 loader 的参数走 [loader.py](nanovllm/utils/loader.py) 的默认函数：
 
 ```python
+# param是目标nn.Parameter，loaded_weight是文件读出的Tensor；把训练数值复制进目标，隐式返回None。
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
+    # 将训练好的数值原地复制进已有参数存储，目标设备可能是 GPU；不是创建新模型层。
     param.data.copy_(loaded_weight)
 ```
 
@@ -3045,6 +3707,7 @@ GPU 1:  后一部分 output rows
 权重按输入维度切分。每张 GPU 计算一部分贡献，然后：
 
 ```python
+# 默认在所有 rank 间对部分输出 y 求和，并让每卡都得到完整结果；会更新传入的 Tensor。
 dist.all_reduce(y)
 ```
 
@@ -3075,13 +3738,22 @@ LM Head 每张卡只算一段词表 logits，最后 `gather` 到 rank 0 并拼�
 源码位置：[llm_engine.py](nanovllm/engine/llm_engine.py)，`LLMEngine.__init__()`：
 
 ```python
+# mp 是 torch.multiprocessing；ctx 是采用 spawn 方式创建进程/Event 的上下文，不是 Attention 的
+# Context。
 ctx = mp.get_context("spawn")
+# i 是非零 GPU rank，从 1 到 TP-1；rank 0 在当前进程创建，单卡时这里没有循环。
 for i in range(1, config.tensor_parallel_size):
+    # 创建跨进程同步通知对象，rank 0 写好共享消息后用它唤醒该 worker。
     event = ctx.Event()
+    # 创建子进程配置；target 是要调用的类，args 是传给 ModelRunner 构造函数的配置、rank、Event。
     process = ctx.Process(target=ModelRunner, args=(config, i, event))
+    # 真正启动新 Python 进程，开始构造该 rank 的 Runner；上一行仅创建进程控制对象。
     process.start()
+    # 保存子进程控制对象，退出时可逐个 join 等待结束；ps 不存模型层参数。
     self.ps.append(process)
+    # 保存给各 worker 的通知对象列表，rank 0 广播控制消息时逐个 set。
     self.events.append(event)
+# 在当前进程创建 rank 0 的模型执行器；第三个参数是通知其他 rank 的 Event 列表。
 self.model_runner = ModelRunner(config, 0, self.events)
 ```
 
@@ -3099,10 +3771,15 @@ PyTorch Linear 权重存储为 `[out,in]`。假设一个输入向量有 4 维、
 源码位置：[linear.py](nanovllm/layers/linear.py)，完整 `RowParallelLinear.forward()`：
 
 ```python
+# 定义RowParallelLinear前向：x为本卡分片输入Tensor，self是线性层；返回跨rank求和后的完整输出Tensor。
 def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # RowParallelLinear 用本卡输入和权重计算部分贡献；bias 仅由 rank 0 加一次，避免 all-reduce 重复累加。
     y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+    # tp_size 是分布式进程/GPU 数；只有多卡才需要合并各卡部分结果。
     if self.tp_size > 1:
+        # 默认在所有 rank 间对部分输出 y 求和，并让每卡都得到完整结果；会更新传入的 Tensor。
         dist.all_reduce(y)
+    # 返回线性层的完整输出Tensor；多卡时已完成部分和的all-reduce。
     return y
 ```
 
@@ -3115,11 +3792,17 @@ def forward(self, x: torch.Tensor) -> torch.Tensor:
 源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`write_shm()` 的连续节选：
 
 ```python
+# 将方法名与展开的请求参数列表序列化成 bytes；其中 Sequence 会使用 __getstate__ 精简快照。
 data = pickle.dumps([method_name, *args])
+# n 是序列化消息的字节数，不是 token 数、batch size 或模型层数。
 n = len(data)
+# 共享内存前4字节保存长度；to_bytes 把整数编码为小端字节，worker 据此知道读取多少消息。
 self.shm.buf[0:4] = n.to_bytes(4, "little")
+# 从第4字节起复制 n 字节消息，右端 n+4 不包含在切片内；不是写 GPU KV 缓存。
 self.shm.buf[4:n+4] = data
+# rank 0 的 self.event 是通知对象列表；逐个通知非零 rank，本地模型计算随后也会执行。
 for event in self.event:
+    # 把同步信号置为已通知，解除 worker 的 wait；不是更改 Sequence 的状态枚举。
     event.set()
 ```
 
@@ -3177,11 +3860,17 @@ Prefill 形状变化大，仍走 eager；Decode batch 超过 512 也走 eager。
 源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`run_model()` 开头：
 
 ```python
+# Prefill、强制普通执行或 Decode 请求数大于512时走正常模型调用；否则尝试已捕获 CUDA Graph。
 if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    # 内层先计算 hidden states，外层 LM Head 再计算 logits；此处不会直接得到文本或 token ID。
     return self.model.compute_logits(self.model(input_ids, positions))
+# 与同缩进层的条件分支配对；前面条件不成立时执行这里的替代路径。
 else:
+    # 这里是 Decode 的 batch size，每条请求只有一个输入ID，因此 input_ids 第0维长度等于请求数。
     bs = input_ids.size(0)
+    # 读取当前进程 Runner 设置的 Context，包含模式、长度边界和物理块映射；不是每条请求独有的新对象。
     context = get_context()
+    # 从按大小排列的捕获尺寸中找第一个不小于真实bs的尺寸，再取得对应 CUDAGraph。
     graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 ```
 
@@ -3194,14 +3883,23 @@ else:
 同一方法中，更新固定缓冲区的连续源码：
 
 ```python
+# graph_vars 是固定缓冲区字典；把真实ID复制进前bs个位置，保持捕获图使用的存储地址不变。
 graph_vars["input_ids"][:bs] = input_ids
+# 更新固定位置缓冲区的真实请求部分；不是重新捕获位置编码运算。
 graph_vars["positions"][:bs] = positions
+# 先将全部目标slot原地置为无效 -1，padding 程序将跳过缓存写入。
 graph_vars["slot_mapping"].fill_(-1)
+# 再把本轮真实请求的KV写入位置复制进前bs项，其他 padding 保持 -1。
 graph_vars["slot_mapping"][:bs] = context.slot_mapping
+# 原地清零全部可见历史长度，避免padding误读取上轮请求的上下文。
 graph_vars["context_lens"].zero_()
+# 填入真实请求长度，供本轮 FlashAttention 访问有效缓存。
 graph_vars["context_lens"][:bs] = context.context_lens
+# 复制当前 [真实请求数,本轮最大块数] 区域；两个切片分别限制行和列，不要求每轮块表宽度一致。
 graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+# 重放捕获的模型GPU操作，读取刚更新的固定缓冲区并写入固定输出；不会自动执行Python主调度循环。
 graph.replay()
+# 只取真实请求的隐藏向量并在图外执行LM Head，返回logits，padding输出被丢弃。
 return self.model.compute_logits(graph_vars["outputs"][:bs])
 ```
 
@@ -3214,8 +3912,11 @@ return self.model.compute_logits(graph_vars["outputs"][:bs])
 源码位置：同一文件 `capture_cudagraph()` 中：
 
 ```python
+# 用固定输入/位置缓冲区执行Qwen3，输出复制到固定hidden-state缓冲区；位于with内时被捕获，外部时用于预热。
 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+# 进入CUDA Graph捕获环境；graph接收记录，graph_pool用于复用图内存池，首次可以为None。
 with torch.cuda.graph(graph, self.graph_pool):
+    # 用固定输入/位置缓冲区执行Qwen3，输出复制到固定hidden-state缓冲区；位于with内时被捕获，外部时用于预热。
     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
 ```
 
@@ -3360,8 +4061,11 @@ generate 的返回值                list[dict]，每条包含 text/token_ids
 `bench.py` 创建 256 个随机 token 请求：
 
 ```python
+# 创建基准输入的二维Python列表，外层每项是一个请求的ID序列，不是一次模型调用。
 prompt_token_ids = [
+    # 先随机选100到1024的长度，再生成该数量0到10000的教学ID；randint两端都可取到。
     [randint(0, 10000) for _ in range(randint(100, 1024))]
+    # 外层推导式重复256次，所以创建256条请求；_表示不使用循环编号。
     for _ in range(256)
 ]
 ```
@@ -3371,6 +4075,7 @@ prompt_token_ids = [
 ### 22.1 为什么先 warm up
 
 ```python
+# 正式计时前运行一次短请求，默认采样参数用于吸收首次调用开销；这不是计入吞吐的请求批次。
 llm.generate(["Benchmark: "], SamplingParams())
 ```
 
@@ -3404,11 +4109,17 @@ throughput = 所有请求实际要求的输出 token 总数 / 总生成秒数
 源码位置：[bench.py](bench.py)，`main()` 的连续节选：
 
 ```python
+# 正式计时前运行一次短请求，默认采样参数用于吸收首次调用开销；这不是计入吞吐的请求批次。
 llm.generate(["Benchmark: "], SamplingParams())
+# 保存当前墙钟秒数作为开始时刻，变量t此时是时间点。
 t = time.time()
+# 运行基准批次，输入直接是整数列表；每条请求有自己的参数，关闭进度条显示。
 llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+# 当前时刻减开始时刻得到耗时秒数；同名变量t现在由时间点变为持续时间。
 t = (time.time() - t)
+# 把每条请求计划生成上限相加；基准设ignore_eos=True才可按该总量统计预期输出。
 total_tokens = sum(sp.max_tokens for sp in sampling_params)
+# 生成总token除以整次调用耗时秒数，单位为 output tokens/s，不是输入prompt吞吐。
 throughput = total_tokens / t
 ```
 
@@ -3470,18 +4181,29 @@ throughput = total_tokens / t
 完整模型必须用 GPU，但 `Sequence` 和 `BlockManager` 的大部分逻辑是纯 CPU 的。可以单独写小脚本，用假的小 block 数测试：
 
 ```python
+# 从nanovllm.engine.sequence导入名字Sequence；定义CPU请求记录Sequence。导入名字不等于构造对象。
 from nanovllm.engine.sequence import Sequence
+# 从nanovllm.engine.block_manager导入名字BlockManager；定义CPU缓存块管理器BlockManager。导入名
+# 字不等于构造对象。
 from nanovllm.engine.block_manager import BlockManager
 
+# 学习实验显式设置类级逻辑块容量为256，确保手算与 BlockManager 的 block_size 一致。
 Sequence.block_size = 256
+# range生成0到299，list转成300个教学ID；构造请求但不执行真实模型。
 seq = Sequence(list(range(300)))
+# 实验仅有8个物理块，每块256个token；创建的是CPU元数据，不会申请GPU缓存。
 manager = BlockManager(num_blocks=8, block_size=256)
 
+# cached 的单位是命中的块数，0也表示空间足够且无命中；-1才表示无法分配。
 cached = manager.can_allocate(seq)
+# 按查询得到的命中块数执行分配，并修改seq.block_table；当前实验空间足够。
 manager.allocate(seq, cached)
 
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print("num_blocks:", seq.num_blocks)
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print("block_table:", seq.block_table)
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print("free blocks:", list(manager.free_block_ids))
 ```
 
@@ -3526,32 +4248,56 @@ Sampler：             logits.shape、采样 token
 下面是完整教学脚本，用两个假设 token 代替 GPU/Sampler 返回值。它只验证 CPU 管理逻辑，**不验证模型计算、FlashAttention 或 CUDA 是否正常**。仍需先装好项目依赖，因为包导入会加载相关模块。
 
 ```python
+# 从types导入名字SimpleNamespace；提供SimpleNamespace，创建教学实验的轻量属性对象。导入名字不等于构造对象。
 from types import SimpleNamespace
 
+# 从nanovllm.engine.scheduler导入名字Scheduler；定义等待/运行队列与调度器Scheduler。导入名字不等于构造对象
+# 。
 from nanovllm.engine.scheduler import Scheduler
+# 从nanovllm.engine.sequence导入名字Sequence；定义CPU请求记录Sequence。导入名字不等于构造对象。
 from nanovllm.engine.sequence import Sequence
+# 从nanovllm.sampling_params导入名字SamplingParams；定义每条请求的SamplingParams。导入名字不等于构
+# 造对象。
 from nanovllm.sampling_params import SamplingParams
 
+# 教学替身只提供Scheduler需要的字段，不读取真实模型目录；不是生产环境Config创建方式。
 config = SimpleNamespace(
+    # CPU实验本轮最多选4条请求，方便观察；与token预算是不同限制。
     max_num_seqs=4,
+    # CPU实验单轮Prefill最多安排256token，长输入可被分段。
     max_num_batched_tokens=256,
+    # 假设结束符ID设为9999，故人工采样40/50不会触发EOS；真实引擎从tokenizer读取。
     eos=9999,
+    # CPU实验每个逻辑/物理块容量设为256token，和Sequence.block_size保持一致。
     kvcache_block_size=256,
+    # CPU实验允许8个物理块；真实引擎的这个数由显存预算计算。
     num_kvcache_blocks=8,
 )
+# 创建一条手算请求，输入3token、最多输出2token，供后续模拟调度。
 seq = Sequence([10, 20, 30], SamplingParams(max_tokens=2))
+# 根据教学配置创建waiting/running和BlockManager；并未构造GPU模型。
 scheduler = Scheduler(config)
+# 提交该对象到waiting队列，还没有采样或缓存计算。
 scheduler.add(seq)
 
+# 依次用40、50代替两轮GPU返回值，模拟Prefill产出和下一轮Decode产出。
 for fake_token in [40, 50]:
+    # 此次为直接调用教学调度器；首轮True，次轮False，同时更新计划数和块表。
     seqs, is_prefill = scheduler.schedule()
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print("计划:", is_prefill, seq.num_scheduled_tokens, seq.block_table)
+    # 用长度1的假采样列表匹配长度1的seqs；管理逻辑按真实流程更新状态和回收缓存。
     scheduler.postprocess(seqs, [fake_token], is_prefill)
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print("结果:", seq.status.name, seq.token_ids, seq.num_cached_tokens)
 
+# 验证两队列都空，说明模拟请求已按长度上限结束。
 assert scheduler.is_finished()
+# 验证只输出人工追加部分，未把prompt算作completion。
 assert seq.completion_token_ids == [40, 50]
+# 验证结束回收清空请求块表；不意味着token列表也被清空。
 assert seq.block_table == []
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print("完成:", seq.completion_token_ids)
 ```
 
@@ -3618,9 +4364,12 @@ nvidia-smi
 例如 [config.py](nanovllm/config.py) 的导入应把标准库与第三方库分开：
 
 ```python
+# 导入模块os；处理路径和操作系统接口，此项目用expanduser/isdir/path.join。
 import os
+# 从dataclasses导入名字dataclass；提供dataclass/fields，自动构造配置对象并查询声明字段。导入名字不等于构造对象。
 from dataclasses import dataclass
 
+# 从transformers导入名字AutoConfig；读取模型配套配置/分词器，实际网络计算仍由本项目源码实现。导入名字不等于构造对象。
 from transformers import AutoConfig
 ```
 
@@ -3706,10 +4455,15 @@ python -m pip check
 目标：建立“文字不是模型输入”的直觉。
 
 ```python
+# tokenizer练习的普通字符串输入，先观察怎样被切成不同大小的token。
 text = "你好，Nano-vLLM!"
+# encode把普通文字变成整数列表；需要事先创建配套tokenizer。
 ids = tokenizer.encode(text)
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(ids)
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(tokenizer.convert_ids_to_tokens(ids))
+# 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
 print(tokenizer.decode(ids))
 ```
 
@@ -3722,7 +4476,9 @@ print(tokenizer.decode(ids))
 ### 练习 3：直接传 token IDs
 
 ```python
+# 先在调用者侧编码问题，下一行将直接传这些ID，add_request不再重复encode。
 ids = tokenizer.encode("解释一下 KV Cache。")
+# 外层[ids]表示一条请求；不是把ID列表中的每个整数当成一个独立prompt。
 outputs = llm.generate([ids], SamplingParams(max_tokens=32))
 ```
 
@@ -3782,7 +4538,9 @@ torch_dtype
 当前 `step()` 已能返回刚完成的序列，但不是每轮新 token。尝试设计 generator：
 
 ```python
+# 未来接口设计示意，当前项目没有stream_generate；需要先实现流式API，不能直接运行此练习片段。
 for update in llm.stream_generate(...):
+    # 将括号内表达式的当前结果显示到终端；多个值默认用空格分隔，print本身不修改请求状态，返回None。
     print(update)
 ```
 
@@ -3861,10 +4619,15 @@ for update in llm.stream_generate(...):
 首次跑通：
 
 ```python
+# 配置速查的引擎构造片段，path必须先设为真实模型目录；每执行一次都会新建引擎及GPU资源。
 LLM(
+    # 将模型目录作为第一个位置参数传入构造函数；不是Hugging Face仓库ID或Git路径。
     path,
+    # 请求禁用Decode CUDA Graph，便于入门调试；各层torch.compile装饰器仍然存在。
     enforce_eager=True,
+    # 设置单GPU/单rank；不是同时处理请求的数量，也不是模型层数。
     tensor_parallel_size=1,
+    # 设置引擎位置/缓存相关上限为2048；当前代码没有在add_request严格检查prompt+输出长度。
     max_model_len=2048,
 )
 ```
@@ -3872,11 +4635,17 @@ LLM(
 追求吞吐：
 
 ```python
+# 配置速查的引擎构造片段，path必须先设为真实模型目录；每执行一次都会新建引擎及GPU资源。
 LLM(
+    # 将模型目录作为第一个位置参数传入构造函数；不是Hugging Face仓库ID或Git路径。
     path,
+    # 允许Runner初始化时捕获Decode CUDA Graph，运行时选择对应图重放。
     enforce_eager=False,
+    # 设置单GPU/单rank；不是同时处理请求的数量，也不是模型层数。
     tensor_parallel_size=1,  # 多卡时改成合适的 GPU 数
+    # Prefill一轮总token预算16384；不是每条请求的最大输出长度。
     max_num_batched_tokens=16384,
+    # 一轮最多调度512条请求；实际数量还受队列和可用KV资源限制。
     max_num_seqs=512,
 )
 ```
@@ -3884,12 +4653,19 @@ LLM(
 显存不足时优先尝试：
 
 ```python
+# 配置速查的引擎构造片段，path必须先设为真实模型目录；每执行一次都会新建引擎及GPU资源。
 LLM(
+    # 将模型目录作为第一个位置参数传入构造函数；不是Hugging Face仓库ID或Git路径。
     path,
+    # 请求禁用Decode CUDA Graph，便于入门调试；各层torch.compile装饰器仍然存在。
     enforce_eager=True,
+    # 学习配置把位置/缓存相关上限降为1024；调用者仍需控制实际prompt加输出长度。
     max_model_len=1024,
+    # 将Prefill总预算降为2048，主要降低初始化预热和每批运行规模。
     max_num_batched_tokens=2048,
+    # 将每轮请求数上限降为64；减少预热/图等批量资源需求，具体显存仍需实测。
     max_num_seqs=64,
+    # KV容量计算使用整体显存80%的预算；不是单独给KV Cache分配80%显存。
     gpu_memory_utilization=0.8,
 )
 ```
@@ -3943,6 +4719,385 @@ LLMEngine.step
 13. 为什么 `generate()` 的输出顺序不会被动态调度打乱？
 14. 这个项目为什么不能直接加载任意 Hugging Face 模型？
 15. 从离线 demo 到生产 API 还缺哪些系统能力？
+
+---
+
+## 28. 源码参数、变量和函数逐项查阅
+
+本章不是让你一次背完，而是解决“源码里这个名字从哪来、什么类型、什么单位、谁用它”的问题。`self` 已在第 2.14 节解释，以下表格主要展开其他名字；源码文件链接指向定义位置，函数签名中的类型标注不是运行时自动校验器。
+
+### 28.1 先认清这一轮的数据，不要把列表和 Tensor 混在一起
+
+| 名字 | 典型类型/形状 | 来源与用途 |
+|---|---|---|
+| `prompts` | `list[str]` 或 `list[list[int]]` | 用户提交的所有输入，外层一项是一条请求 |
+| `prompt` | `str`，随后可能变 `list[int]` | generate 遍历的一条输入；add_request 编码后复用这个变量名 |
+| `sampling_params` / `sp` | 参数对象或对象列表 / 单对象 | 前者是公开 API 实参；sp 是 zip 拆出的一条参数 |
+| `seq` | `Sequence` | 一条 CPU 请求记录，不是输入 Tensor |
+| `seqs` / `scheduled_seqs` | `list[Sequence]` | 本轮被调度的对象列表，决定打包顺序 |
+| `input_ids` | 先 `list[int]`，后 GPU `[T]` Tensor | Runner 汇集本轮实际计算的输入 token，不是所有历史 token |
+| `positions` | 先 `list[int]`，后 GPU `[T]` Tensor | 每个输入 token 在自己的请求中的逻辑位置，供 RoPE 使用 |
+| `hidden_states` | 浮点 `[T,H]` Tensor | Embedding/Transformer 的向量结果，不可直接当文字解码 |
+| `logits` | rank 0 上 `[B,V]` Tensor | 每条请求对词表的原始分数，多卡先汇总词表分片 |
+| `temperatures` | 先浮点列表，后 `[B]` Tensor | 从本轮各 Sequence 取温度，顺序与 logits 行一致 |
+| `sample_tokens` | 整数 `[B]` Tensor | Sampler 的返回值，每个整数对应一个请求的预测 ID |
+| `token_ids` | 因函数不同而不同，详见 28.15 | 可能是整条序列、当前块或本轮预测，不能仅凭名字判断 |
+| `outputs` | 字典→ID列表→字典列表 | generate 分阶段复用此名字，最终返回 text/token_ids |
+
+T 是本轮实际输入 token 总数，B 是本轮请求数。Prefill 通常 T 大于 B；Decode 每条请求一个 token，因此 T 等于 B。H/V 是模型配置的隐藏维/词表大小，不是请求长度。
+
+### 28.2 example.py：公开接口的每个实参
+
+定义/使用位置：[example.py](example.py)、[llm_engine.py](nanovllm/engine/llm_engine.py)、[sampling_params.py](nanovllm/sampling_params.py)。
+
+| 调用位置 | 实参 | 含义与注意点 |
+|---|---|---|
+| `LLM(path, ...)` | `path` / 构造函数的 `model` | 本地模型目录；在 Config 中检查目录存在 |
+| 同上 | `enforce_eager` | Runner 是否禁用 Decode CUDA Graph；不是整体关闭 torch.compile |
+| 同上 | `tensor_parallel_size` | 参与计算的 GPU/rank 数；不是请求 batch 数 |
+| 同上 | 其他 `**kwargs` | 经 Config 字段集合过滤后用于构造引擎配置；字段表见第 10 章 |
+| `SamplingParams(...)` | `temperature` | 采样温度，必须为大于约 1e-10 的正数 |
+| 同上 | `max_tokens` | 新生成 token 数上限，不含 prompt，思考及特殊 token 也计数 |
+| 同上 | `ignore_eos` | False 时遇到 EOS 可以提前停，True 时忽略 EOS |
+| `generate(...)` | `prompts` | 必须用外层列表区分请求；一条已编码请求写 `[ids]` |
+| 同上 | `sampling_params` | 单对象供全部请求使用，或等长逐请求参数列表 |
+| 同上 | `use_tqdm=True` | 是否显示生成进度条，不影响模型数学结果 |
+| `apply_chat_template(...)` | 消息列表 | 每项是 role/content 字典，示例只有一条 user 消息 |
+| 同上 | `tokenize=False` | 先返回格式化字符串，后续 add_request 再 encode |
+| 同上 | `add_generation_prompt=True` | 按模型模板加入开始 assistant 回答的提示 |
+| `print(f"...{value!r}")` | `!r` | 使用 repr 展示字符串，换行常显示为 `\n`；不是模型多生成了反斜杠 |
+
+`LLM(...)` 返回一个引擎对象；`generate(...)` 返回实际为 `list[dict]` 的结果；`SamplingParams(...)` 返回配置对象；聊天模板返回字符串；不要把这些不同类型互换。
+
+### 28.3 LLMEngine：函数接收什么，输出什么
+
+源码：[nanovllm/engine/llm_engine.py](nanovllm/engine/llm_engine.py)。
+
+| 方法 | 参数逐项解释 | 返回/副作用 |
+|---|---|---|
+| `__init__(model, **kwargs)` | model 为目录；kwargs 为引擎资源设置字典 | 完成配置、进程、Runner、tokenizer、Scheduler 初始化；构造得到引擎 |
+| `add_request(prompt, sampling_params)` | 一条文字/整数列表；一个采样参数对象 | 创建一条 Sequence，放入 waiting；返回 None |
+| `step()` | 无额外参数，使用引擎内部队列 | `(完成请求列表, num_tokens统计值)` |
+| `is_finished()` | 无额外参数 | 代理 Scheduler，返回所有队列是否为空 |
+| `generate(prompts, sampling_params, use_tqdm)` | 批量输入、单/逐请求参数、进度条开关 | 阻塞直到所有已提交请求结束，返回结果字典列表 |
+| `exit()` | 无额外参数 | 通知 Runner 退出，等待子进程完成；由 atexit 注册 |
+
+初始化变量补充：
+
+- `config_fields`：允许的字段名集合；`field` 是 dataclass 字段描述对象，不是用户请求。
+- `config_kwargs`：从 kwargs 筛选出的合法配置字典；`k/v` 在这里是字典键/值，不是 Attention 的 Key/Value。
+- `ctx`：spawn 多进程上下文；`self.ps`：子进程控制对象列表；`self.events`：各 worker 的通知对象列表。
+- `pbar`：tqdm 进度条对象；`t`：某一轮 step 的起始时间；`prefill_throughput/decode_throughput`：对应模式最近更新的 token/s 估计。
+- `output`（单数）：一个 step 返回的已完成列表；`outputs`（复数）：整个 generate 的结果收集容器。
+
+### 28.4 Sequence：构造参数和每个辅助方法
+
+源码：[nanovllm/engine/sequence.py](nanovllm/engine/sequence.py)。全部成员字段、读写者和生命周期见第 11 章，此处补函数参数。
+
+| 方法 | 参数含义 | 实际返回/影响 |
+|---|---|---|
+| `__init__(token_ids, sampling_params)` | 非空整数输入列表；请求采样参数，默认一个 SamplingParams | 复制输入列表并初始化计数、策略、状态、空块表 |
+| `__len__()` | 无额外参数 | 返回 `num_tokens`，使 `len(seq)` 可用 |
+| `__getitem__(key)` | key 可以是整数下标或 Python slice 对象 | 返回 token_ids 的一个整数或切片 |
+| `block(i)` | i 为从 0 开始的逻辑块编号 | 该逻辑块的 token ID 列表，不是 GPU K/V |
+| `append_token(token_id)` | 一个预测整数 ID | 更新列表、last_token、总长度；返回 None，不判停 |
+| `__getstate__()` | pickle 自动调用 | 返回六项执行状态 tuple |
+| `__setstate__(state)` | state 是与导出顺序相同的六项 tuple | 恢复执行快照；Decode 不保留完整 ID 列表 |
+
+序列化 tuple 的位置必须固定：`(num_tokens, num_prompt_tokens, num_cached_tokens, num_scheduled_tokens, block_table, last_state)`。`last_state` 在 Prefill 是列表，Decode 是末 token 整数；`isinstance(last_state, list)` 决定恢复路径。worker 快照不是完整主调度对象，不能期待所有 property 都有完整所需字段。
+
+`counter=count()` 提供递增 ID，`SequenceStatus` 是枚举类，`auto()` 自动为枚举项生成值；程序应比较命名状态而不是依赖其具体整数值。`is_finished` 等 property 没有调用参数，读取时不写括号。
+
+### 28.5 Scheduler：请求、预算和队列变量
+
+源码：[nanovllm/engine/scheduler.py](nanovllm/engine/scheduler.py)。
+
+| 方法 | 参数/结果 |
+|---|---|
+| `__init__(config)` | 从 Config 接收请求数上限、Prefill token 预算、EOS、块数/容量；创建队列与 BlockManager |
+| `add(seq)` | 把这个对象加入 waiting，返回 None |
+| `schedule()` | 返回 `(list[Sequence], bool)`；bool 表示整个批次是否 Prefill，同时修改请求计划/队列 |
+| `preempt(seq)` | 对当前请求释放 KV、标 WAITING、放回左端；保留 token_ids，返回 None |
+| `postprocess(seqs, token_ids, is_prefill)` | 列表位置配对；计数和追加、判停、回收，返回 None |
+| `is_finished()` | 无参数，两个队列都空时 True |
+
+| 局部/成员名字 | 类型与单位 | 解释 |
+|---|---|---|
+| `waiting/running` | `deque[Sequence]` | 等待 Prefill/可 Decode 的请求队列，不是待复制的 Tensor |
+| `scheduled_seqs` | 请求列表 | 本轮执行顺序，返回后 Runner 沿同顺序打包 |
+| `num_batched_tokens` | token 数 | 本轮已经安排的 Prefill 总量，不是所有请求总长 |
+| `remaining` | token 数 | Prefill 预算减已安排量，剩余可以分配多少 |
+| `num_tokens` | token 数 | 当前 seq 尚需执行的 Prefill 量，已扣掉缓存 |
+| `num_cached_blocks` | 块数，失败时 -1 | 前缀查询结果，乘 block_size 才能变成 token 数 |
+| `self.eos` | 一个整数 ID | 比较采样 token 是否结束，不是结束文本字符串 |
+
+### 28.6 Block 与 BlockManager：元数据函数
+
+源码：[nanovllm/engine/block_manager.py](nanovllm/engine/block_manager.py)。
+
+| 方法 | 参数 | 返回或修改 |
+|---|---|---|
+| `Block(block_id)` | 一个物理编号 | 构造含 ref_count/hash/token_ids 的 CPU 元数据对象 |
+| `Block.update(hash, token_ids)` | 完整前缀哈希；本块整数内容 | 保存可复用内容，返回 None；hash 参数不是内置函数调用 |
+| `Block.reset()` | 无参数 | 新使用时 ref_count=1，清除旧哈希/内容，返回 None |
+| `BlockManager(num_blocks, block_size)` | 物理块总数；每块 token 容量 | 创建CPU索引/队列，没有GPU Tensor分配 |
+| `compute_hash(token_ids, prefix=-1)` | 当前完整块ID列表；此前前缀哈希，-1表示无前缀 | xxhash 的整数摘要；classmethod 自动提供 cls |
+| `can_allocate(seq)` | 一条请求对象 | 可匹配前缀块数；-1表示容量不足，0不是失败 |
+| `allocate(seq, num_cached_blocks)` | 请求、已确认命中数量 | 引用匹配块并分配剩余块，写块表/缓存数，返回 None |
+| `_allocate_block()` | 无参数，内部操作 | 取空闲ID、删除旧映射并重置元数据，返回物理 ID |
+| `deallocate(seq)` | 待回收请求 | 减引用，归还无引用块，清空请求映射，返回 None |
+| `_deallocate_block(block_id)` | 已无活跃引用的物理 ID | used→free，返回 None |
+| `can_append(seq)` | 当前 Decode 请求 | bool，判断新增块需求与 free 数量 |
+| `may_append(seq)` | 当前 Decode 请求 | 必要时追加一个物理块ID，返回 None |
+| `hash_blocks(seq)` | 当前已执行但尚未更新计数的请求 | 为本轮新完成完整块登记哈希，返回 None |
+
+哈希路径中的变量：`h` 为截至当前完整块的链式哈希；`prefix` 为前一个哈希；`token_ids` 在这里仅是一个块的内容；`num_new_blocks` 为仍需占用的空闲 ID 数。
+
+`np.array(token_ids).tobytes()` 把 ID 列表变成 NumPy 数组并取其字节表示，供 xxhash 处理；`prefix.to_bytes(8, 'little')` 用 8 字节小端编码前一个哈希。这里的 `8` 是字节数，不是 block size 或 TP 数。
+
+`hash_blocks()` 的 `start/end` 是**逻辑块边界**，来自缓存/计划 token 数除以 block_size；Runner 的 `prepare_prefill()` 中 start/end 则是 **token 位置**。同名不代表同一单位。
+
+### 28.7 ModelRunner：执行函数实参与返回值
+
+源码：[nanovllm/engine/model_runner.py](nanovllm/engine/model_runner.py)。
+
+| 方法 | 参数逐项说明 | 结果 |
+|---|---|---|
+| `__init__(config, rank, event)` | Config；当前 GPU 进程编号；rank0使用Event列表、worker使用单Event | 构建模型分片、权重、采样器、缓存、可选图和IPC |
+| `call(method_name, *args)` | 方法名字符串；该方法的实参tuple | 多卡通知worker并执行本地方法，返回被调用方法的结果 |
+| `write_shm(method_name, *args)` | 同上，只有多卡rank0执行 | 序列化消息并通知，返回 None |
+| `read_shm()` | worker等待通知，没有显式输入 | `(方法名,参数列表)`，取得共享内存快照 |
+| `loop()` | 无参数 | worker不断读消息并调用，直到收到exit |
+| `warmup_model()` | 使用已有config/模型 | 构造假输入、执行Prefill并统计显存，不返回用户结果 |
+| `allocate_kv_cache()` | 使用配置及显存统计 | 分配大Tensor并绑定各层，更新num_kvcache_blocks，返回 None |
+| `prepare_block_tables(seqs)` | 本轮Sequence列表 | `[B,最大块表长度]` 的GPU int32 Tensor |
+| `prepare_prefill(seqs)` | 本轮Prefill请求列表 | `(input_ids,positions)`，并设置Prefill Context |
+| `prepare_decode(seqs)` | 本轮Decode请求列表 | 同类二元组，但每条请求只有一个ID，设置Decode Context |
+| `prepare_sample(seqs)` | 本轮请求列表，rank0使用 | GPU float32 的 `[B]` 温度Tensor |
+| `run_model(input_ids, positions, is_prefill)` | GPU整数ID、逻辑位置、批次模式 | 正常路径或图重放后的logits；非零rank汇总后无完整词表返回 |
+| `run(seqs, is_prefill)` | 请求对象、批次模式 | rank0为采样ID列表，非零rank为None；最后reset_context |
+| `capture_cudagraph()` | 使用模型、配置和固定缓冲区 | 建立图集合与graph_vars，返回 None |
+| `exit()` | 无参数 | 关闭IPC、同步GPU并销毁通信组 |
+
+显存与预热变量：
+
+| 名字 | 单位/含义 |
+|---|---|
+| `world_size/rank` | 进程总数/当前编号；本项目分别对应TP GPU数/设备编号 |
+| `hf_config` | 模型配置对象，提供层数、维度、dtype，不是全部权重 |
+| `default_dtype` | 临时切换前的PyTorch默认精度，用于初始化末尾恢复 |
+| `seq_len` | 预热每条假请求长度，取Prefill预算与模型长度较小值 |
+| `num_seqs` | 预热假请求数量，根据预算、长度和请求上限计算 |
+| `free/total/used` | GPU字节数；free和total来自mem_get_info，used=total-free |
+| `peak/current` | PyTorch分配器峰值/当前已分配字节统计，用于估计运行余量 |
+| `num_kv_heads` | 当前GPU分片上的KV head数，模型总数除world_size |
+| `head_dim` | 一个Attention head的向量宽度，不是token个数 |
+| `block_bytes` | 一个物理块跨所有层的K/V占用字节数 |
+| `hf_config.dtype.itemsize` | 每个模型数值占用字节数；乘元素数量才能得到显存字节数 |
+| `config.num_kvcache_blocks` | 预算可容纳的物理块数量，整除block_bytes得到 |
+
+### 28.8 Prefill/Decode 打包与 Context 的参数
+
+定义：[context.py](nanovllm/utils/context.py)；设置：[model_runner.py](nanovllm/engine/model_runner.py)；读取：[attention.py](nanovllm/layers/attention.py)、[embed_head.py](nanovllm/layers/embed_head.py)。
+
+| 参数/变量 | 类型与形状 | 精确含义 |
+|---|---|---|
+| `is_prefill` | bool | 本次前向路径，不是“这一GPU永远只做Prefill” |
+| `cu_seqlens_q` | int32 `[B+1]` | 本轮输入Q的累计边界，从0开始 |
+| `cu_seqlens_k` | int32 `[B+1]` | 每条可见K长度累计值，包含历史缓存 |
+| `max_seqlen_q/max_seqlen_k` | 整数token数 | 本轮最长Q/可见K长度，传给FlashAttention |
+| `slot_mapping` | int32 `[T]` | 每个本轮输入token的物理写入位置，-1表示无效 |
+| `context_lens` | int32 `[B]` | Decode每条可见上下文长度，包括本轮输入 |
+| `block_tables` | int32 `[B,M]` | 各条请求的物理块表，M是本批最大表长；不同表长用填充值补齐 |
+| `start/end` | token逻辑位置 | Prefill当前片段左闭右开区间 |
+| `seqlen_q/seqlen_k` | token数 | 当前请求本轮输入数 / 历史加输入的可见数 |
+| `start_block/end_block` | 逻辑块边界 | 当前片段会写入哪些块，end_block不包含 |
+| `slot_start/slot_end` | 物理slot边界 | 当前逻辑块内实际需要写入的物理位置范围 |
+| `max_len` | 块数 | prepare_block_tables中本轮最长块表宽度 |
+
+`set_context(...)` 的参数就是表格前八项；调用时未提供的字段采用默认值。`get_context()` 返回当前进程保存的Context，`reset_context()` 用一个默认Context替换它。它们不复制或销毁历史KV大Tensor。
+
+示例：物理块ID=7、block_size=256、块内位置=3，则slot=1795。逻辑位置3不等于物理slot1795，FlashAttention/Triton需要不同信息，不能把两个参数互换。
+
+### 28.9 Qwen3 与投影：各类 forward 的输入
+
+源码：[nanovllm/models/qwen3.py](nanovllm/models/qwen3.py)。
+
+| 类/方法 | 参数 | 返回 |
+|---|---|---|
+| `Qwen3ForCausalLM(config)` | Hugging Face模型配置 | 外层网络，持有Qwen3Model和LM Head |
+| `Qwen3ForCausalLM.forward(input_ids, positions)` | 整数ID、逻辑位置Tensor | `[T,H]` hidden states，不是logits |
+| `compute_logits(hidden_states)` | Transformer的隐藏向量 | 逐请求词表分数，由LM Head处理Prefill尾索引 |
+| `Qwen3Model.forward(input_ids, positions)` | 与外层相同 | Embedding→多层Decoder→最终Norm的隐藏向量 |
+| `Qwen3DecoderLayer.forward(positions, hidden_states, residual)` | 位置、主分支 `[T,H]`、残差或None | `(hidden_states,residual)`，两路必须继续传递 |
+| `Qwen3Attention.forward(positions, hidden_states)` | 位置、归一化后的 `[T,H]` | QKV→RoPE→Attention→输出投影的 `[T,H]` |
+| `Qwen3MLP.forward(x)` | `[T,H]` | 合并Gate-Up→门控激活→Down的 `[T,H]` |
+
+构造参数与中间变量：
+
+| 名字 | 从哪来/是什么意思 |
+|---|---|
+| `hidden_size` | H，模型每token的隐藏向量维度 |
+| `intermediate_size` | I，MLP中间宽度，通常不同于H |
+| `num_heads/total_num_heads` | 输入配置的总Q头数 / 保留下来的总Q头字段；self.num_heads后来是每卡数量 |
+| `num_kv_heads/total_num_kv_heads` | 总KV头数 / 相应总数字段；self.num_kv_heads是每卡KV数量 |
+| `head_dim` | 每head维度，优先显式配置，否则按hidden_size/总Q头数推导 |
+| `q_size/kv_size` | 每卡Q宽度 / 每卡K或V宽度；用于split合并QKV |
+| `scaling` | `head_dim ** -0.5`，传入Attention的分数缩放系数 |
+| `qkv_bias` | 是否使用QKV偏置，也影响此实现的QK Norm分支 |
+| `rms_norm_eps` | Norm分母中的微小稳定常数 |
+| `max_position` | 可建立RoPE位置表的长度，来自模型位置配置 |
+| `rope_theta` / `base` | RoPE频率基数，同一值在不同函数中的名字 |
+| `rope_scaling` | 可选配置字典，本实现从中读取可能覆盖的rope_theta，不代表完整实现所有缩放策略 |
+| `hidden_act` | 激活名字字符串，本项目断言为'silu' |
+| `qkv` | 合并投影结果，随后拆成三个Tensor |
+| `q/k/v` | 查询/键/值Tensor；不是config_kwargs循环中的字典键值 |
+| `o/output` | Attention多头结果 / 输出投影后的隐藏向量 |
+| `gate_up` | 合并的Gate与Up分支，最后维随后一分为二 |
+| `residual` | 累积残差Tensor；首次为None，后面单独传递并在Norm融合 |
+
+### 28.10 Attention 与 Triton：指针参数也要分清
+
+源码：[nanovllm/layers/attention.py](nanovllm/layers/attention.py)。
+
+`Attention(num_heads, head_dim, scale, num_kv_heads)` 的四个构造参数分别是每卡Q头数、每头宽度、缩放系数、每卡KV头数。`forward(q,k,v)` 接收本轮新算出的三个Tensor；历史缓存来自成员属性，长度/映射来自Context，不是额外塞在q参数里。
+
+`store_kvcache(key, value, k_cache, v_cache, slot_mapping)` 的前两个实参是本轮 `[T,KVheads,d]`，中间两个是本层分页缓存，最后是 `[T]` 目标slot。该函数检查stride并启动kernel，返回None。
+
+| kernel 参数/局部变量 | 解释 |
+|---|---|
+| `key_ptr/value_ptr` | 本轮K/V的GPU存储指针；传入Tensor时Triton使用底层地址 |
+| `key_stride/value_stride` | 相邻token起点在各自Tensor中的元素距离，不是字节长度 |
+| `k_cache_ptr/v_cache_ptr` | 当前模型层的K/V缓存指针 |
+| `slot_mapping_ptr` | 本轮目标slot数组指针，每项为一个整数 |
+| `D: tl.constexpr` | 每token的KV元素数=KVheads*head_dim；编译时常量供kernel生成使用 |
+| `idx` | 当前program负责本轮第几个token，来自 `tl.program_id(0)` |
+| `slot` | 从映射表读出的物理token存储位置，-1则跳过 |
+| `key_offsets/value_offsets` | 本轮新K/V向量读取元素偏移 |
+| `cache_offsets` | 目标缓存向量写入元素偏移，slot乘D加向量内索引 |
+| `key/value` | kernel加载的D个工作元素，不是Sequence的整数ID列表 |
+| `N` | Python启动函数中本轮输入token数，决定启动多少个program |
+
+`store_kvcache_kernel[(N,)](...)` 中方括号指定启动网格 `(N,)`，圆括号才是实参；这不是普通Python列表索引。`tl.arange(0,D)` 构造向量内偏移，`tl.load` 从GPU地址读，`tl.store` 写。kernel负责数据写入，Python调用没有业务返回值。
+
+FlashAttention 实参读法：
+
+- `q/k/v`：本轮查询与键值，存在前缀时K/V可改为分页缓存。
+- `cu_seqlens_q/k`：每请求的累计边界，避免不同请求相互Attention。
+- `max_seqlen_q/k`：本批最大长度。
+- `block_table`：库调用的参数名，对应Context中的复数 `block_tables`。
+- `cache_seqlens`：Decode参数名，对应 `context_lens`，单位为token。
+- `softmax_scale`：传入head_dim倒数平方根。
+- `causal=True`：使用因果限制，不能看见当前位置之后的token。
+- `q.unsqueeze(1)`：Decode从 `[B,Qheads,d]` 加一维成为 `[B,1,Qheads,d]`，1表示每请求一个query。
+
+### 28.11 RoPE、RMSNorm 与门控激活
+
+源码：[rotary_embedding.py](nanovllm/layers/rotary_embedding.py)、[layernorm.py](nanovllm/layers/layernorm.py)、[activation.py](nanovllm/layers/activation.py)。
+
+| 函数/方法 | 参数与结果 |
+|---|---|
+| `get_rope(head_size, rotary_dim, max_position, base)` | 每head宽度、旋转宽度、位置表长度、频率基数；返回共享缓存的RoPE模块 |
+| `RotaryEmbedding(...)` | 对应构造字段；当前断言rotary_dim=head_size，不支持仅旋转部分head维 |
+| `RotaryEmbedding.forward(positions, query, key)` | 按逻辑位置查角度并旋转Q/K，返回两个Tensor，不旋转V |
+| `apply_rotary_emb(x, cos, sin)` | 待旋转向量、位置对应余弦/正弦表；分两半旋转再拼回，返回同宽度Tensor |
+| `RMSNorm(hidden_size, eps)` | 最后向量宽度、分母稳定常数；创建可训练缩放weight，推理只读取 |
+| `rms_forward(x)` | 没有residual的基础Norm，返回Tensor |
+| `add_rms_forward(x, residual)` | 先相加再Norm，返回 `(归一化值,合并残差)` |
+| `RMSNorm.forward(x, residual=None)` | 根据残差是否None选择上面两种路径，因此返回类型也不同 |
+| `SiluAndMul.forward(x)` | x最后一维含Gate/Up两段，返回 `SiLU(Gate)*Up`，最后维减半 |
+
+RoPE变量：`inv_freq` 是各旋转维的频率，`t` 是位置索引Tensor，`freqs` 是位置乘频率的角度表，`cos/sin` 是其余弦/正弦，`cos_sin_cache` 合并保存两者。`register_buffer(..., persistent=False)` 注册非参数状态，让其随模块设备移动，但不作为需要保存到state_dict的持久状态。[PyTorch register_buffer 官方说明](https://docs.pytorch.org/docs/2.8/generated/torch.nn.Module.html#torch.nn.Module.register_buffer)
+
+Norm变量：`orig_dtype` 保存输入精度；`var` 虽名为var，实际是平方均值而非减均值后的方差；`eps` 保证零附近稳定；`weight` 是每特征缩放参数。`x/y` 在SiluAndMul里分别代表Gate/Up，在其他函数中不是这个含义。
+
+### 28.12 Embedding、LM Head 与 Sampler
+
+源码：[embed_head.py](nanovllm/layers/embed_head.py)、[sampler.py](nanovllm/layers/sampler.py)。
+
+| 方法/字段 | 参数/类型与含义 |
+|---|---|
+| `VocabParallelEmbedding(num_embeddings, embedding_dim)` | 总词表V、隐藏宽H；每卡存 `[V/TP,H]` 权重 |
+| `forward(x)`（Embedding） | x是整数ID，不是hidden states；返回查表结果，多卡mask后求和 |
+| `vocab_start_idx/vocab_end_idx` | 当前rank负责词表ID的左闭右开范围 |
+| `mask` | bool Tensor，输入ID是否属于当前卡；不属于本卡的输出置零 |
+| `ParallelLMHead(..., bias=False)` | 使用同类词表分片权重，当前实现禁止bias |
+| `forward(x)`（Head） | x是浮点hidden states；Prefill先选末query，再投影词表 |
+| `last_indices` | `[B]` 的末query行下标，不是每条请求的末token ID |
+| `all_logits` | rank0接收的各卡词表分片列表，最后沿V维拼接 |
+| `Sampler.forward(logits, temperatures)` | `[B,V]` 和 `[B]` 输入；返回 `[B]` 整数ID |
+| `probs` | softmax后的概率；实际代码随后原地除以随机数，不能在那之后仍把它当原始概率 |
+
+输入Embedding与输出LM Head可以共享权重存储，由 `config.tie_word_embeddings` 决定。这是权重共享，不表示两者的输入/输出类型相同：前者输入整数查表，后者输入向量算词表分数。
+
+### 28.13 loader 与并行 Linear：参数对象、权重文件和分片
+
+源码：[loader.py](nanovllm/utils/loader.py)、[linear.py](nanovllm/layers/linear.py)。
+
+| 函数/参数/变量 | 含义 |
+|---|---|
+| `load_model(model, path)` | 接收已构造网络和目录，遍历safetensors，副作用是写入参数，返回None |
+| `default_weight_loader(param, loaded_weight)` | 目标Parameter与完整文件Tensor，普通参数直接copy |
+| `file/f/weight_name` | 文件路径/读取上下文对象/参数名字字符串，分别不同类型 |
+| `param_name/param` | 运行时完整参数名 / get_parameter找到的对象 |
+| `packed_modules_mapping` | 文件模块名到合并模块名、分段标签的映射字典 |
+| `k/v`（loader循环） | 原名字片段/目标名字片段，都是字符串，不是Attention的K/V |
+| `shard_id/loaded_shard_id` | 合并区间标签，QKV为q/k/v，Gate-Up为0/1，不是rank编号 |
+| `weight_loader` | 保存在变量或Parameter属性上的可调用方法；名字不代表Tensor |
+| `param_data` | 目标参数底层Tensor，后续narrow可能取得待写入区间的view |
+| `input_size/output_size` | 线性层输入/输出宽度，权重在PyTorch里布局 `[out,in]` |
+| `bias` | 是否创建偏置/实际偏置Tensor；RowParallel只在rank0加一次 |
+| `tp_dim` | 权重切分维：0为输出行，1为输入列；不是Tensor的设备编号 |
+| `tp_rank/tp_size` | 当前卡编号/总卡数，来自分布式进程组 |
+| `shard_size/start_idx` | 本卡沿切分维的长度 / 在完整权重的起始位置 |
+| `shard_offset` | 合并参数里某段的起点，先选Q/K/V或Gate/Up区域 |
+| `output_sizes` | Gate-Up等合并层的原始输出宽度列表 |
+
+`divide(numerator, denominator)` 先断言能整除，再返回整数商。`loaded_weight.narrow(dim,start,length)` 沿dim选连续区间，参数第三项是**长度**，不是右端下标；`chunk(tp_size,dim)[tp_rank]` 则选当前rank的分片。
+
+加载函数的职责是“选本rank及对应合并段的数值并写入Parameter”，forward职责是“使用参数进行矩阵运算”。同一个层同时有这两个方法，不代表每轮forward都从磁盘重读权重。
+
+### 28.14 CUDA Graph 与 IPC 的参数和单位
+
+源码：[nanovllm/engine/model_runner.py](nanovllm/engine/model_runner.py)。
+
+| 名字 | 类型/单位 | 解释 |
+|---|---|---|
+| `max_bs/bs` | 请求数 | 捕获缓冲区最大容量 / 当前实际Decode batch |
+| `max_num_blocks` | 块数 | 一个请求按max_model_len估算的最大块表宽度 |
+| `graph_bs` | 整数列表 | 已准备的图尺寸，例如默认含1/2/4/8/16… |
+| `graphs` | 尺寸→CUDAGraph字典 | 运行时按bs找到图，不是模型参数字典 |
+| `graph_pool` | 图内存池标识或None | 捕获图共享内存池；不是waiting请求队列 |
+| `graph_vars` | 字符串→Tensor字典 | 固定输入、位置、slot、长度、块表和隐藏输出缓冲区 |
+| `outputs`（图缓冲区） | `[max_bs,H]` 浮点Tensor | 此处是隐藏向量，不是generate的返回字典列表 |
+| `method_name/args` | str / 实参集合 | 控制消息如'run'及seqs/is_prefill，发送到worker |
+| `data/n` | bytes / 字节数 | pickle消息及其长度，不能用n代替token数 |
+| `self.shm.buf` | 共享内存字节视图 | 前4字节为长度，随后为消息；不是GPU显存 |
+| `event` | 进程同步对象 | set通知、wait等待、clear复位；不保存采样结果 |
+
+固定图缓冲区赋值是复制数据到旧存储；给Python变量重新赋一个新Tensor，是重新绑定引用。Graph使用捕获时的存储地址，二者不能互换。第20章展示的 `.replay()` 不重新运行Python循环，也不自动重新准备Context。
+
+### 28.15 最容易误认的同名变量和不同编号
+
+| 名字/编号 | 在哪一处 | 真正含义 |
+|---|---|---|
+| `token_ids` | Sequence | prompt+completion完整列表 |
+| 同名 | Block/BlockManager | 一块的内容，用于哈希 |
+| 同名 | Runner.run、Scheduler.postprocess | 本轮每请求一个预测ID的列表 |
+| 同名 | generate结果字典 | 当前请求全部completion IDs，不含prompt |
+| `num_tokens` | Sequence | 当前总长度 |
+| 同名 | Scheduler.schedule局部 | 当前请求待算的Prefill量 |
+| 同名 | LLMEngine.step局部 | 正负号标记模式的吞吐统计值 |
+| `t` | bench.py/引擎计时 | 开始时间或随后变成耗时 |
+| 同名 | RoPE构造 | 位置索引Tensor，不是时间 |
+| `seq_id` | 主调度Sequence | 真实请求编号，用于输出排序 |
+| `rank` | 多GPU进程 | 当前参与计算的进程/GPU编号 |
+| `block_id` | 缓存管理 | 一个物理块编号 |
+| `i`（seq.block） | 序列逻辑块 | 从0开始的逻辑块索引，须查block_table变成物理ID |
+| `slot` | K/V写入 | 物理token位置=block_id*block_size+块内偏移 |
+| `token_id` | 词表与生成 | 模型词表里的整数编号，完全不同于物理slot |
+
+遇到“看起来认识这个名字，却读不懂这一行”，请先确认**当前文件、当前类、当前函数、赋值来源、单位和形状**。这些信息比变量拼写更可靠。
 
 ---
 
