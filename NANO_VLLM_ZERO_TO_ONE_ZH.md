@@ -4342,6 +4342,15 @@ def forward(self, x: torch.Tensor) -> torch.Tensor:
 
 ### 20.5 哪个分支选择 eager，哪个分支选择 replay？
 
+先简单理解这两个词：
+
+- **eager（普通执行）**：正常调用模型，由程序按代码组织并执行本轮计算。可以理解为“每次现场安排 GPU 要做的工作”。
+- **replay（重放）**：先更新输入数据，再重放之前记录好的 CUDA Graph，减少每轮重复安排 GPU 工作的开销。
+
+打个比方：eager 像每次做菜都逐条下达操作指令；replay 像提前记录好操作流程，换上新食材后按流程执行。
+
+**replay 重用的是计算流程，不是上一次的答案。** 每次仍会根据新输入重新计算。这里的 eager 也不代表完全没有编译优化：模块中的 `@torch.compile` 仍然可以生效。
+
 源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`run_model()` 开头：
 
 ```python
