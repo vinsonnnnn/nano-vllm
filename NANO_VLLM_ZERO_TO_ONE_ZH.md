@@ -5,6 +5,7 @@
 > 学习目标：不仅会运行示例，还能说清一次文本生成怎样经过调度器、模型、KV Cache 和采样器，最终变成输出文字。
 > 本次修订：2026-10-09。在源码调用链基础上，给全部 Python 代码块补充逐行解释，并增加参数、变量、函数和常用操作查阅。
 > 源码基线：修订开始时的提交 `2a8302a`；本次只修改教学文档，不修改推理代码。
+> 补充修订：2026-10-10。扩写 16.3 节 RMSNorm，新增 19.9 节 NCCL，并在 20.3 节补充 torch.compile 入门解释。
 
 ## 怎样使用这份笔记
 
@@ -46,6 +47,7 @@
 - [17. 从隐藏状态到下一个 token：LM Head 与采样](#17-从隐藏状态到下一个-tokenlm-head-与采样)
 - [18. 权重加载](#18-权重加载)
 - [19. 张量并行 Tensor Parallelism](#19-张量并行-tensor-parallelism)
+  - [19.9 NCCL：多张 GPU 怎样交换和合并结果](#199-nccl多张-gpu-怎样交换和合并结果)
 - [20. CUDA Graph 与 torch.compile](#20-cuda-graph-与-torchcompile)
 - [21. 一次请求的完整时序复盘](#21-一次请求的完整时序复盘)
 - [22. Benchmark 怎么读、怎么测](#22-benchmark-怎么读怎么测)
@@ -3227,21 +3229,261 @@ forward 时按 position 查表，再应用旋转。`get_rope` 使用 `lru_cache(
 
 ### 16.3 RMSNorm
 
-RMSNorm 简化公式：
+#### 16.3.1 先理解它在干什么：调整特征向量的整体尺度
+
+`RMSNorm` 的全称是 **Root Mean Square Normalization**，可译为“均方根归一化”。它不是生成文字的采样器，也不是位置编码；它接收模型内部的浮点特征向量，调整数值的整体大小，再交给后续模块。
+
+可以先记住：**对每个 token 的特征向量，先按整体大小缩放，再乘上模型学到的逐维权重。输入输出的形状不变。**
+
+例如同一种相对比例，可以表现为 `[3, 4]`，也可以表现为 `[30, 40]`。它们整体大小相差十倍。忽略很小的 `eps` 时，RMSNorm 在乘权重前会把它们缩放成相同的结果。这样能减少整体尺度变化对后续计算的影响。归一化层用于帮助稳定网络计算，但不代表能够保证所有数值问题都消失。[RMSNorm 原论文](https://arxiv.org/abs/1910.07467)
+
+**不是把每个数限制到 0～1，也不是把向量变成概率。** 输出可以为负，可以大于 1，而且元素之和通常不等于 1；那是它与 Softmax 的重要区别。
+
+#### 16.3.2 “均方根”怎么计算？手算一次就能理解
+
+名字按计算顺序拆开看：先**平方**，再求**平均**，最后**开根号**。
+
+假设一个 token 的特征向量只有两维 `x = [3, 4]`，为了手算暂时忽略 `eps`，并假设权重为 `[1, 1]`：
 
 ```text
-y = x / sqrt(mean(x²) + eps) × weight
+原向量：       x = [3, 4]
+每个元素平方： x² = [9, 16]
+平方的平均：   mean(x²) = (9 + 16) / 2 = 12.5
+均方根：       RMS = sqrt(12.5) ≈ 3.5355
+除以均方根：   [3 / 3.5355, 4 / 3.5355] ≈ [0.8485, 1.1314]
+乘逐维权重：   [0.8485 × 1, 1.1314 × 1] ≈ [0.8485, 1.1314]
 ```
 
-与 LayerNorm 相比，它不减均值。源码先转为 FP32 计算平方均值，再转回原 dtype，提高数值稳定性。
+如果改为 `[30, 40]`，均方根也扩大十倍，变成约 `35.3553`，除完仍约为 `[0.8485, 1.1314]`。注意这是**对正的整体缩放、忽略 eps 后**的结果，不意味着任意两个不同向量都会变成一样。
 
-`add_rms_forward` 同时完成：
+真正用于项目的公式是：
 
 ```text
-x = x + residual
-residual = x
-x = RMSNorm(x)
+denominator = sqrt(mean(x²) + eps)
+y[i] = (x[i] / denominator) × weight[i]
 ```
+
+`i` 表示向量中某个维度的下标。一个向量的各维共用同一个分母，但分别乘自己的 `weight[i]`。[PyTorch RMSNorm 公式说明](https://docs.pytorch.org/docs/2.8/generated/torch.nn.RMSNorm.html)
+
+#### 16.3.3 参数、变量和形状分别是什么意思？
+
+源码在 [layernorm.py](nanovllm/layers/layernorm.py)。本项目自己实现了 `RMSNorm`，不是直接使用 `torch.nn.RMSNorm`；下面的默认参数和计算细节以本项目为准。
+
+| 名字 | 含义与来源 | 形状或例子 |
+|---|---|---|
+| `self` | 当前 RMSNorm 实例；不同归一化层有各自的参数 | 如 `input_layernorm` 或 `q_norm` 对象 |
+| `hidden_size` | 要归一化的最后一维长度；构造时传入 | hidden state 使用 `config.hidden_size`；Q/K 使用 `head_dim` |
+| `eps` / `self.eps` | 加在平方均值上的小正数，避免分母为零并改善数值稳定性 | 构造默认 `1e-6`，Qwen3 调用时传入模型配置值 |
+| `self.weight` | 每个特征维度的可学习缩放权重，又常写作 `gamma` | `[H]`，初始化为全 1；之后加载模型文件中的训练结果 |
+| `x` | 要处理的浮点特征，不是 token ID，也不是采样概率 | hidden state 常为 `[T,H]` |
+| `orig_dtype` | 输入原来的数据类型，用于计算后转回 | 如 `torch.bfloat16`、`torch.float16` |
+| `var` | **平方的平均值**；注意源码变量名容易误导，它不是统计学中减去均值后计算的方差 | `[T,1]`，每个 token 一个数 |
+| `residual` | 残差主干上的特征，与 x 同形状；有它时先相加，再归一化 | `[T,H]`，或不提供时为 `None` |
+
+这里 `T` 是这次打包进模型的输入 token 数，`H` 是特征宽度。它不是固定等于请求数：Prefill 一条请求可能带入多个 token，Decode 通常每条请求带入一个 token。
+
+例如 `x` 的形状是 `[2,4]`，表示两个 token，各有四个特征。计算时：
+
+```text
+x：                         [2,4]
+x.pow(2)：                  [2,4]  每个元素平方
+mean(dim=-1, keepdim=True)： [2,1]  每个 token 的四个平方值取平均
+缩放系数：                  [2,1]  每个 token 一个系数
+归一化后的 x：              [2,4]  系数广播到对应行的四个特征
+self.weight：               [4]    同一层的逐维权重被各 token 共用
+输出 y：                    [2,4]
+```
+
+**`dim=-1` 指最后一维，不是最后一个 token。** `keepdim=True` 表示求平均后保留长度为 1 的维度，方便广播相乘。每行独立计算分母，不把不同 token 混起来求一个平均值。
+
+在 Q/K 的场景，输入形状是 `[T,heads,head_dim]`，仍只沿最后一维计算，所以得到 `[T,heads,1]` 的分母：每个 token 的每个 head 分别归一化。
+
+#### 16.3.4 完整源码：没有 residual 时逐行看
+
+下面是 `RMSNorm` 的完整类，增加了教学注释，未改变原实现。先读构造函数、`rms_forward()` 和底部的 `forward()`；中间的残差分支下一小节再解释。
+
+```python
+# 继承 PyTorch 的模块基类；对象调用 norm(x) 时会进入 forward。
+class RMSNorm(nn.Module):
+
+    def __init__(
+        self,                     # 当前归一化模块实例
+        hidden_size: int,         # 最后一维的特征数；也是 weight 的长度
+        eps: float = 1e-6,        # 默认的小正数，可以用 eps=... 覆盖
+    ) -> None:
+        super().__init__()        # 初始化 nn.Module，之后才能正常注册参数
+        self.eps = eps            # 保存数值稳定项，供各次计算使用
+        # 全 1 是初始化值；nn.Parameter 让这组权重被模块识别为模型参数。
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    @torch.compile               # 建立编译计算路径，不改变这里的数学含义
+    def rms_forward(
+        self,
+        x: torch.Tensor,         # 不带额外 residual 的输入浮点张量
+    ) -> torch.Tensor:
+        orig_dtype = x.dtype     # 先记住输入类型，以便末尾恢复
+        x = x.float()            # 将中间计算转成 FP32，提高平方与求平均的稳定性
+        # pow(2) 是逐元素平方；mean 沿最后一维取平均，不减去均值。
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        # rsqrt(a) = 1 / sqrt(a)；mul_ 原地相乘，实现除以均方根。
+        x.mul_(torch.rsqrt(var + self.eps))
+        # 先转回原类型，再按最后一维乘可学习权重，不是矩阵乘法。
+        x = x.to(orig_dtype).mul_(self.weight)
+        return x                 # 输出特征，形状与输入一致
+
+    @torch.compile
+    def add_rms_forward(
+        self,
+        x: torch.Tensor,         # 当前子层算出的增量特征
+        residual: torch.Tensor,  # 残差主干特征，形状应与 x 对应
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        orig_dtype = x.dtype
+        # 两个输入先转成 FP32，再逐元素相加。
+        x = x.float().add_(residual.float())
+        # 保存加法结果的原精度版本；这里保存的是归一化之前的主干。
+        residual = x.to(orig_dtype)
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        x.mul_(torch.rsqrt(var + self.eps))
+        x = x.to(orig_dtype).mul_(self.weight)
+        # 第一个值给下一子层，第二个值沿残差主干保留。
+        return x, residual
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,  # 可选；不传时默认 None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:                  # 没有额外残差输入
+            return self.rms_forward(x)        # 返回一个 Tensor
+        else:                                 # 有残差输入
+            return self.add_rms_forward(x, residual)  # 返回两个 Tensor
+```
+
+类型标注中的 `|` 表示“或者”，不是这里进行数值运算。`tuple[Tensor, Tensor]` 表示两个张量组成的元组，所以调用者需要相应地接收两个结果。
+
+这里的源码节选依赖文件顶部的 `import torch`、`from torch import nn`，不应只复制类就当成无依赖的脚本。
+
+注意另一个细节：`mul_` 和 `add_` 末尾的下划线表示**原地操作**。不能笼统认为函数永远不会影响原来的张量：如果 `x` 本来已经是 FP32，`x.float()` 可能返回同一张量，后续原地操作就可能修改它。低精度输入转 FP32 时通常会得到不同存储。阅读这段代码时，要区分“变量重新赋值”和“张量存储被修改”。
+
+#### 16.3.5 weight 为什么不是多余的？eps 为什么不能随便删？
+
+除以均方根，是按整条向量的尺度进行统一缩放；乘 `weight`，则允许模型对不同特征维度分别调整重要程度。举个假设例子：
+
+```text
+归一化后的向量： [0.8485, 1.1314]
+某层学到的权重： [2.0,    0.5]
+最终输出：       [1.6970, 0.5657]
+```
+
+因此“RMSNorm 后均方根等于 1”不是对最终输出的严格保证：乘权重之前、忽略 eps 时才有这个性质；实际还会受 eps 和数值精度影响。
+
+`nn.Parameter(torch.ones(hidden_size))` 不是让每次推理重新学习这些权重。它先创建参数，项目的 [loader.py](nanovllm/utils/loader.py) 再把模型文件里的训练结果加载进去；当前项目执行的是推理，不在这里训练。
+
+如果输入是全零向量，平方均值也是零。没有 `eps` 就可能除以零；加上它后分母为正，零向量仍可输出零。`eps` 是数值稳定项，不是采样温度，也不是学习率。
+
+#### 16.3.6 为什么还要传 residual？两个返回值怎么接？
+
+残差连接可以先理解为：**保留一条主干，把 Attention/MLP 算出的增量加回去**。这里归一化的是“增量加上主干”之后的向量，而不是让 RMSNorm 自己去计算 Attention。
+
+`add_rms_forward()` 的逻辑顺序是：
+
+```text
+s = x + old_residual          先相加
+new_residual = s              留下归一化前的主干
+normalized = RMSNorm(s)       调整尺度，准备给下一子层
+返回 normalized, new_residual
+```
+
+手算示例，暂时忽略 eps，权重全 1：
+
+```text
+当前增量 x：      [1, 2]
+旧主干 residual：[2, 2]
+相加结果 s：     [3, 4]
+新主干：         [3, 4]
+归一化结果：     约 [0.8485, 1.1314]
+```
+
+调用代码因此是：
+
+```python
+# 有 residual：返回两个 Tensor，分别接收归一化输入和更新后的主干。
+hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+```
+
+而没有 residual 的普通调用是：
+
+```python
+# 没有 residual：只返回一个 Tensor，不能按两个值拆包。
+normalized = norm(x)
+```
+
+后一个是调用形式示意，假设 `norm` 已创建、`x` 已准备好，不是独立脚本。
+
+**保存 residual 并不是多存一份归一化结果。** 主干的作用和送给下一子层的归一化输入不同；不能把两个返回值互换。
+
+**精度与共享存储的边界：** 上面的“保留归一化前主干”描述对应项目常见的 FP16/BF16 输入。此时 FP32 中间结果转回低精度会创建另一份存储。但如果原输入本来就是 FP32，`residual = x.to(orig_dtype)` 可能与 x 共用存储，随后对 x 的原地归一化、乘权重也会改到 residual。因此不能把这个手算流程无条件套用到 FP32 输入；这是当前实现的边界，不是 RMSNorm 公式本身的性质，也不能把普通赋值当成自动复制张量。本次仅说明现有行为，没有修改实现。
+
+源码把残差加法和 RMSNorm 放在一个被 `torch.compile` 装饰的函数中，给编译器提供一起优化的机会，但不能仅凭函数名字就保证它在任何环境都只生成一个 GPU kernel。
+
+#### 16.3.7 项目中在哪些位置调用它？沿 Decoder Layer 走一遍
+
+调用与构造位于 [qwen3.py](nanovllm/models/qwen3.py)，不是在 `Sequence` 或 Scheduler 内处理请求元数据。
+
+| 对象 | 构造/调用位置 | 处理的数据与目的 |
+|---|---|---|
+| `self.input_layernorm` | `Qwen3DecoderLayer.__init__()` / `forward()` | Attention 之前处理 hidden states，最后一维为 hidden_size |
+| `self.post_attention_layernorm` | 同一个 Decoder Layer | Attention 增量加回 residual，然后归一化，交给 MLP |
+| `self.norm` | `Qwen3Model.__init__()` / `forward()` | 所有 Decoder Layer 之后，合并最后的残差并归一化，再交给 LM Head |
+| `self.q_norm`、`self.k_norm` | `Qwen3Attention`；当前代码在没有 QKV bias 时启用 | 每个 head 的 Q/K 分别归一化，最后一维为 head_dim；之后才做 RoPE |
+
+两个 Decoder Layer 的构造语句是：
+
+```python
+# config.hidden_size 决定逐维权重的长度；eps 使用加载的模型配置。
+self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+# 创建另一套独立的 RMSNorm 参数，不是复用前一个对象。
+self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+```
+
+`Qwen3DecoderLayer.forward()` 的完整方法节选如下。方法中的 `self` 是 Decoder Layer 实例，不是 RMSNorm 实例：
+
+```python
+def forward(
+    self,
+    positions: torch.Tensor,                 # token 位置，传给 Attention 内的 RoPE
+    hidden_states: torch.Tensor,             # 输入特征或上一层 MLP 的增量
+    residual: torch.Tensor | None,           # 第一层为 None，后来携带残差主干
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if residual is None:
+        # 右侧先求值：把归一化结果作为子层输入，把原输入保留为主干。
+        hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+    else:
+        # 后续层：先合并上一层增量与主干，再得到新输入和新主干。
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+    # Attention 接收归一化后的特征，返回本子层的增量。
+    hidden_states = self.self_attn(positions, hidden_states)
+    # Attention 增量加回主干，归一化后准备给 MLP。
+    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+    # MLP 的增量由下一层 input_layernorm 或模型末尾 norm 合并回主干。
+    hidden_states = self.mlp(hidden_states)
+    return hidden_states, residual
+```
+
+这就解释了：为什么本项目把 `hidden_states` 和 `residual` 分开传递，以及为什么有的 RMSNorm 调用返回一个张量，有的返回两个。归一化并没有代替 Attention/MLP，而是出现在它们的输入准备环节。
+
+#### 16.3.8 与 LayerNorm、Softmax、RoPE 怎么区分？
+
+| 操作 | 核心作用 | 本节要记住的区别 |
+|---|---|---|
+| RMSNorm | 按平方均值调整特征的整体尺度，再乘逐维权重 | 不先减均值；不是概率；本项目没有额外的偏置项 |
+| LayerNorm | 先减均值，再按方差调整尺度，可带可学习缩放/偏置 | 方差计算的是偏离均值的平方平均，与源码的 var 不同 |
+| Softmax | 把一组分数转换成总和约为 1 的概率 | 常用于注意力权重或采样，不是这里的尺度归一化 |
+| RoPE | 根据位置旋转 Q/K，融入位置信息 | 解决位置问题，不是代替 RMSNorm |
+
+RMSNorm 省去减均值等计算，形式比 LayerNorm 更简单，但不要在已训练模型中随意把两者替换：模型的结构、权重与训练方式是配套的，替换后不保证结果正确。原论文中的效率结果也不能直接当作本机 nano-vllm 的加速比例。
+
+本节自测：看到 `var = x.pow(2).mean(dim=-1, keepdim=True)`，你应该能回答“沿哪一维计算、得到什么形状、为什么不是方差”；看到 `return x, residual`，你应该能回答“哪个已经归一化、哪个保存的是加法后的主干”。
 
 ### 16.4 SwiGLU 风格激活
 
@@ -3690,6 +3932,8 @@ rank 2：GPU 2 模型分片 + 通信
 
 控制消息通过固定名称的共享内存 `nanovllm` 和 Event 发送，张量结果的合并通过 `torch.distributed` + NCCL 完成。
 
+如果你第一次遇到 NCCL，可以先读 [19.9 节](#199-nccl多张-gpu-怎样交换和合并结果)，再回来读下面的分片与通信代码。
+
 ### 19.2 Column Parallel Linear
 
 权重按输出维度切分：
@@ -3810,6 +4054,227 @@ for event in self.event:
 
 读消息后，非零 rank 用自身模型权重分片计算；LM Head gather 到 rank 0，rank 0 才有完整词表 logits 并采样。这也解释了第 11 章中非零 rank 的 Sequence 快照可以省略调度和采样字段。
 
+### 19.9 NCCL：多张 GPU 怎样交换和合并结果
+
+#### 19.9.1 一句话理解：GPU 之间传递计算结果的通信库
+
+**NCCL** 的全称是 **NVIDIA Collective Communications Library**，中文可理解为“NVIDIA 集合通信库”，常读作 “Nickel”。它负责 GPU 之间的数据通信，包括把多张卡的结果求和、收集到某张卡等，不负责理解提示词或生成文字。[NVIDIA 官方介绍](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/overview.html)
+
+可以用分工合作来理解：张量并行让不同 GPU 各算一部分；NCCL 帮它们交换或合并结果，使后面的计算能够继续。**不是每张卡各自回答一次，再把几段文字拼起来。**
+
+“集合通信”的“集合”不是 Python 的 `set`，而是**同一个通信组的多个参与者共同完成一项通信操作**。例如 `all_reduce` 默认把所有参与者的对应元素相加，并让每个参与者都得到结果。
+
+注意区分几个层次：
+
+| 名字 | 在项目里的职责 | 不要混淆成 |
+|---|---|---|
+| 张量并行 TP | 决定权重怎样分片、各卡算什么、何处合并结果 | NCCL 自动把模型切成多份 |
+| `torch.multiprocessing` | 启动多个 Python 进程 | GPU 张量通信库 |
+| `torch.distributed`，代码简称 `dist` | 提供进程组及通信的 Python 接口 | 只能用于训练 |
+| NCCL，后端名 `"nccl"` | 执行 NVIDIA GPU 间的通信 | 启动进程的工具或模型层 |
+| CUDA | GPU 计算与执行相关的基础设施 | NCCL 的同义词 |
+| 共享内存 + Event | 本项目传递方法名、Sequence 元数据并通知 worker | NCCL 的 GPU 张量传输通道 |
+
+项目代码主要调用 `dist.xxx()`，不是直接调用 NCCL 的底层 C 接口；选择 `"nccl"` 后端后，GPU 通信由 PyTorch 接到 NCCL。
+
+#### 19.9.2 进程组、rank、world_size 是什么？初始化参数逐个看
+
+**进程组（process group）**可以理解为“一起参加通信的进程名单”。本项目每个 rank 是一个 Python 进程，并对应一张 GPU。
+
+假设 `tensor_parallel_size=2`：
+
+```text
+world_size = 2       通信组有两个进程
+rank 0 → 可见 GPU 0  当前主进程，负责调度、采样，也参与模型计算
+rank 1 → 可见 GPU 1  子进程，负责模型分片计算和通信
+```
+
+`rank` 从 0 开始，是通信参与者编号；`world_size` 是总数，不是模型层数、请求数或 token 数。“rank 0”也不是“性能排名第一的 GPU”。GPU 编号是当前进程可见的编号，不应直接等同于机器标签上的物理编号。
+
+源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，`ModelRunner.__init__()` 中的连续节选：
+
+```python
+# 从配置读取参加本次张量并行的进程/GPU 总数。
+self.world_size = config.tensor_parallel_size
+# rank 是构造 Runner 时传入的当前进程编号。
+self.rank = rank
+# rank 0 保存 Event 列表，worker 保存自己的 Event；它用于控制通知，不是 NCCL 参数。
+self.event = event
+
+# 初始化默认通信组；所有参与进程使用相同后端、地址和总数，各自使用不同 rank。
+dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+# 设定当前进程使用哪张可见 GPU；保持项目原来的调用顺序。
+torch.cuda.set_device(rank)
+```
+
+| 参数或调用 | 本项目的值 | 意思 |
+|---|---|---|
+| `backend`，第一个位置参数 | `"nccl"` | 选择 GPU 通信后端 |
+| `init_method`，第二个位置参数 | `"tcp://localhost:2333"` | 初始化时让进程在同一地址会合、建立通信组 |
+| `world_size` | `self.world_size` | 预期参与的总进程数 |
+| `rank` | 当前进程的编号 | 各进程分别为 0、1、…、N−1 |
+| `torch.cuda.set_device(rank)` | 当前可见 GPU 编号 | 将本进程后续 CUDA 工作指向对应 GPU |
+
+`localhost` 指本机，`2333` 是会合端口，不是 HTTP 接口，也不是 GitHub 地址。**不要因此认为全部 GPU 张量都经由这个端口传输**：它用于初始化会合，实际 GPU 通信路径由后端及硬件条件决定。NCCL 可利用 PCIe、NVLink 或网络互连；这份项目代码用本机地址启动的是单机多进程流程，不能只改一个 TP 数值就当作已有完整多机部署方案。
+
+初始化的是默认组，所以后面的 `dist.get_rank()`、`dist.get_world_size()` 和未显式传入 `group` 的通信调用都使用这组。项目中的 `self.tp_rank`、`self.tp_size` 就是读取该组的编号和大小；先建组再构造并行模型层，这个顺序有意义。[PyTorch 进程组说明](https://docs.pytorch.org/docs/2.8/distributed.html#torch.distributed.init_process_group)
+
+#### 19.9.3 all_reduce：把部分贡献求和，每张卡都得到完整结果
+
+源码位置：[linear.py](nanovllm/layers/linear.py)，`RowParallelLinear.forward()` 中的连续节选：
+
+```python
+# 每张卡用自己那一份输入和权重，计算同一输出的部分贡献。
+# bias 若存在只在 rank 0 加一次，防止后面求和时重复计入。
+y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+if self.tp_size > 1:
+    # 默认操作为 SUM：逐元素相加，原地更新每个参与 rank 的 y。
+    dist.all_reduce(y)
+return y
+```
+
+这里 `x` 是本卡的分片输入，`self.weight` 是本卡权重；`y` 是同一输出的部分贡献，而不是某条独立请求的最终答案。
+
+手算两卡例子，假设各卡此时的 y 是：
+
+```text
+通信前：rank 0 的 y = [1, 2]
+        rank 1 的 y = [10, 20]
+
+逐元素求和：[1 + 10, 2 + 20] = [11, 22]
+
+通信后：rank 0 的 y = [11, 22]
+        rank 1 的 y = [11, 22]
+```
+
+**不是拼接成 `[1,2,10,20]`，也不是默认取平均。** `all_reduce` 的 `all` 表示所有参与者都取得归约结果。本项目没有传入别的 `op`，所以按默认 SUM 求和。
+
+调用 `dist.all_reduce(y)` 会更新传入张量；不要误写成 `y = dist.all_reduce(y)`，因为默认调用不返回结果张量。项目因此先调用通信，再 `return y`。
+
+同样的通信也在 [embed_head.py](nanovllm/layers/embed_head.py) 的 `VocabParallelEmbedding.forward()` 出现：一个 token 只由拥有该词表片段的 rank 提供有效 embedding，其他 rank 的对应结果被 mask 成零，求和后每张卡都拿到完整向量。
+
+接口默认没有启用 `async_op=True`。不过 GPU 按 CUDA 流执行，不能简单把“Python 函数返回”理解为“所有 GPU 工作都已在物理上执行完”；当前代码按正常执行流接着使用结果。跨 CUDA 流的高级同步问题不是本节教学例子的前提。
+
+#### 19.9.4 gather：把词表分片收集到 rank 0，再拼成完整 logits
+
+`gather` 和 `all_reduce` 的用途不同：这里**不对词表分数求和，而是把不同词表片段收集起来**。
+
+源码位置：[embed_head.py](nanovllm/layers/embed_head.py)，`ParallelLMHead.forward()` 的连续节选：
+
+```python
+# x 已是每条请求用于预测的 hidden state；本卡只算自己负责的词表分片。
+logits = F.linear(x, self.weight)
+if self.tp_size > 1:
+    # rank 0 为每个 rank 准备一个同形状 GPU 接收张量；其他 rank 不准备接收列表。
+    all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
+    # 第1个参数是本卡发送的张量；第2个是目标 rank 的接收列表；第3个 0 表示目标 rank。
+    # 每个 rank 都必须调用它，不能只让 rank 0 调用。
+    dist.gather(logits, all_logits, 0)
+    # 只有 rank 0 把接收列表沿词表维拼接；其他 rank 的 logits 在这里变成 None。
+    logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+return logits
+```
+
+关键变量：
+
+- `logits`：通信前是本卡的 `[B,V/TP]` 词表分数；`B` 是本轮请求数，`V` 是完整词表大小，`TP` 是参与 GPU 数。当前实现要求 V 能被 TP 整除。
+- `all_logits`：rank 0 的 Python 列表，长度为 TP，**每个元素是 GPU 张量**，不是一张 CPU 数值表；其他 rank 传入 `None`。
+- `0`：`gather` 的目标进程编号 `dst`，不是 GPU 上的 token ID。
+- `torch.cat(..., -1)`：沿最后的词表维拼接，是收集完成后的本地张量操作，不是另一种 NCCL 集合通信。
+
+假设一条请求、六个候选 token，用两张卡：
+
+```text
+B = 1，V = 6，TP = 2
+
+rank 0：负责 token 0～2，logits = [[1, 2, 3]]，形状 [1,3]
+rank 1：负责 token 3～5，logits = [[4, 5, 6]]，形状 [1,3]
+
+gather 后，rank 0 的 all_logits：
+    [张量 [[1, 2, 3]], 张量 [[4, 5, 6]]]
+
+torch.cat 后，rank 0 的完整 logits：
+    [[1, 2, 3, 4, 5, 6]]，形状 [1,6]
+```
+
+这个例子的分数是为了观察形状而假设的，不代表真实模型输出。最终只有 rank 0 持有供采样使用的完整词表分数，再进入第 17 章的 Sampler；非零 rank 不采样，但**依然必须参加 gather**。
+
+一句话对比：**all_reduce 合并“同一输出的部分贡献”，gather 收集“不同输出片段”，本项目再用 cat 把片段拼起来。** gather 并不会自动替你执行 cat。[PyTorch gather 接口](https://docs.pytorch.org/docs/2.8/distributed.html#torch.distributed.gather)
+
+#### 19.9.5 barrier：等大家到达同一个同步点
+
+`dist.barrier()` 可以理解为“集合，等所有参加的进程都到这里”。它不是对某个输入向量求和，也不会生成 token。
+
+源码位置：[model_runner.py](nanovllm/engine/model_runner.py)，初始化末尾的连续节选：
+
+```python
+if self.world_size > 1:
+    if rank == 0:
+        # 主进程先创建控制消息用的共享内存。
+        self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+        # 创建完成后到达同步点，等待 worker。
+        dist.barrier()
+    else:
+        # worker 先到同步点，等 rank 0 完成共享内存创建。
+        dist.barrier()
+        # 之后按相同名称连接已经存在的共享内存。
+        self.shm = SharedMemory(name="nanovllm")
+        # 进入等待命令的工作循环，不是每一轮重新创建进程组。
+        self.loop()
+```
+
+两个分支都有一次对应的 barrier：rank 0 在创建之后到达，worker 在打开之前到达。这样避免 worker 过早去打开尚不存在的共享内存。
+
+退出时 `ModelRunner.exit()` 也使用 barrier 协调共享内存清理，最后调用 `dist.destroy_process_group()` 清理通信组。**销毁进程组不是关闭显卡，更不是卸载 CUDA/NCCL。**
+
+#### 19.9.6 为什么会卡住？集合通信要所有 rank 配合
+
+通信不是 rank 0 单方面“打个电话”就完成。对应的集合操作需要各 rank 按匹配的顺序参与，且发送的数据类型、数量等满足相应操作要求；否则可能等待、报错或产生未定义行为。[NVIDIA 集合通信要求](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html)
+
+例如下面是**不要运行的错误流程示意**：
+
+```text
+rank 0：执行第一个 all_reduce → 执行第二个 all_reduce
+rank 1：执行第一个 all_reduce → 因某个分支直接返回
+
+第二个 all_reduce 缺少 rank 1 的对应调用，rank 0 可能一直等到超时。
+```
+
+这也是为什么只在一个 rank 打断点时，其他 rank 可能看起来“卡死”：它们正等待被你暂停的进程。不能看到通信超时就断定 NCCL 安装坏了，还要检查其他进程是否更早发生了显存不足、异常或退出。
+
+| 现象 | 优先检查 |
+|---|---|
+| 初始化会合等待或超时 | 预期 rank 是否全部启动、world_size 是否一致、端口是否可用 |
+| all_reduce/gather 附近等待或超时 | 其他 rank 是否已异常、各 rank 是否执行相同通信顺序、张量形状/类型是否匹配 |
+| GPU 编号错误或使用不可见设备 | TP 是否超过可见 GPU 数、rank 与当前可见设备是否对应 |
+| `Distributed package doesn't have NCCL built in` | 是否误用 Windows 原生 Python，当前 PyTorch 构建是否支持 NCCL |
+| 多卡能运行但比单卡慢 | 模型/批次是否太小、通信开销、GPU 间互连与负载；卡数增加不保证线性提速 |
+
+如需日志，在已经激活项目环境的 WSL/Linux 终端执行：
+
+```bash
+# 只给这次 Python 进程及其子进程设置 INFO 级 NCCL 日志，不修改源码。
+NCCL_DEBUG=INFO python example.py
+```
+
+`NCCL_DEBUG` 是环境变量，`INFO` 是日志等级；它不是修复开关，也不会让单卡示例自动变成多卡。是否使用多卡仍由 `tensor_parallel_size` 决定。不要直接把这个 Bash 写法照搬到 PowerShell，也不要为看到一个 warning 就随意关闭 NCCL 的传输能力。[NVIDIA 日志变量说明](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-debug)
+
+本项目即使设置 `tensor_parallel_size=1`，仍初始化大小为 1 的 NCCL 进程组，只是上述跨 rank 的 all_reduce/gather 分支不会执行。所以“只有一张卡”不等于“当前源码不依赖 NCCL”。PyTorch 2.8 的后端支持说明也区分 Windows 原生与 Linux；这与第 4 章推荐本项目在 Linux/WSL2 中运行相呼应。[PyTorch 后端支持说明](https://docs.pytorch.org/docs/2.8/distributed.html#backends-that-come-with-pytorch)
+
+#### 19.9.7 本节小结：沿项目调用链再读一遍
+
+```text
+LLMEngine 启动各 rank
+    → 每个 ModelRunner 初始化同一个默认进程组，选择 nccl 后端
+    → 各 GPU 用自己的权重分片计算
+    → Embedding / RowParallelLinear 使用 all_reduce 合并部分贡献
+    → ParallelLMHead 使用 gather 收集词表分数到 rank 0
+    → rank 0 使用 cat 拼成完整 logits，再由 Sampler 选 token
+    → 结束时各 rank 清理进程组
+```
+
+你现在应能区分：**TP 决定怎么分工，NCCL 执行 GPU 通信，all_reduce 求和，gather 收集，barrier 同步。** 控制命令仍由共享内存和 Event 传递，不是每个 Python 对象都走 NCCL。
+
 ---
 
 ## 20. CUDA Graph 与 torch.compile
@@ -3843,13 +4308,33 @@ Prefill 形状变化大，仍走 eager；Decode batch 超过 512 也走 eager。
 
 ### 20.3 哪些部分使用 `torch.compile`
 
+**`torch.compile` 是 PyTorch 提供的计算优化工具：把函数或模型中的张量计算交给编译器分析，尝试生成更高效的执行代码。** 可以理解为“计算目标不变，优化完成计算的方式”，不是重新训练模型，也不是把 Python 源文件编译成一个独立应用。
+
+例如本项目的 [activation.py](nanovllm/layers/activation.py)，`SiluAndMul.forward()` 完整方法如下：
+
+```python
+# 装饰器：让下面这个方法通过 torch.compile 的优化路径执行。
+@torch.compile
+def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # 将输入张量沿最后一维分成两半；x、y 分别保存两部分。
+    x, y = x.chunk(2, -1)
+    # 对第一部分做 SiLU 激活，再与第二部分逐元素相乘。
+    return F.silu(x) * y
+```
+
+这里 `self` 是 `SiluAndMul` 实例，`F` 是 `torch.nn.functional` 的简称。`@torch.compile` 是装饰器写法；编译器可能将激活、乘法等操作融合，减少中间数据读写和执行开销，但**不保证每次都能融合，也不保证所有场景都更快**。
+
+在这个项目中，使用它的主要是以下小计算模块，而不是给整个 LLMEngine 加一个编译开关：
+
 - RoPE forward；
 - RMSNorm；
 - residual add + RMSNorm；
 - SiLU + multiply；
 - Sampler。
 
-它让 PyTorch 尝试融合和优化这些小算子。首次调用出现编译等待是正常现象。
+首次调用可能需要分析、生成代码和编译，因此通常比后续调用慢；后续条件适用时可以复用编译结果。输入形状、类型等条件改变时，也可能重新编译，不是“启动时编译一次后永远不再编译”。[PyTorch 2.8 官方说明](https://docs.pytorch.org/docs/2.8/generated/torch.compile.html)
+
+与本项目手动使用的 **CUDA Graph** 相比，`torch.compile` 主要优化“计算怎么执行”，CUDA Graph 主要记录并重放 GPU 操作，减少重复提交开销。两者可以一起使用，并非互相替代；编译器内部也可能利用 CUDA Graph。项目的 `enforce_eager=True` 关闭 Runner 的手动 CUDA Graph 路径，**不会移除这些 `@torch.compile` 装饰器**。
 
 ### 20.4 CUDA Graph 中包含什么
 
