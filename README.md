@@ -16,6 +16,8 @@ A lightweight vLLM implementation built from scratch.
 
 项目后续性能、调度、KV Cache、多卡和工程能力的演进建议请见 [Nano-vLLM 未来优化路线图](NANO_VLLM_OPTIMIZATION_ROADMAP_ZH.md)。
 
+简历描述、面试开场讲解及分类问题与参考答案请见 [Nano-vLLM 简历与面试讲解指南](NANO_VLLM_INTERVIEW_GUIDE_ZH.md)。
+
 ## Key Features
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
