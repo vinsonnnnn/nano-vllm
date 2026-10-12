@@ -6,7 +6,7 @@
 > 本次修订：2026-10-09。在源码调用链基础上，给全部 Python 代码块补充逐行解释，并增加参数、变量、函数和常用操作查阅。
 > 源码基线：修订开始时的提交 `2a8302a`；本次只修改教学文档，不修改推理代码。
 > 补充修订：2026-10-10。扩写 16.3 节 RMSNorm，新增 19.9 节 NCCL，并在 20.3 节补充 torch.compile 入门解释。
-> 补充修订：2026-10-12。在第 21 章新增新模型适配与多模态适配的扩展讨论。
+> 补充修订：2026-10-12。在第 21 章补充各核心模块的职责、协作流程与面试讲解。
 
 ## 怎样使用这份笔记
 
@@ -51,7 +51,7 @@
   - [19.9 NCCL：多张 GPU 怎样交换和合并结果](#199-nccl多张-gpu-怎样交换和合并结果)
 - [20. CUDA Graph 与 torch.compile](#20-cuda-graph-与-torchcompile)
 - [21. 一次请求的完整时序复盘](#21-一次请求的完整时序复盘)
-  - [21.3 扩展讨论：新模型适配与多模态适配](#213-扩展讨论新模型适配与多模态适配)
+  - [21.3 各核心模块负责什么：沿一条请求理解职责与协作](#213-各核心模块负责什么沿一条请求理解职责与协作)
 - [22. Benchmark 怎么读、怎么测](#22-benchmark-怎么读怎么测)
 - [23. 推荐的源码阅读和调试路线](#23-推荐的源码阅读和调试路线)
 - [24. 常见报错与排查](#24-常见报错与排查)
@@ -4565,159 +4565,232 @@ generate 的返回值                list[dict]，每条包含 text/token_ids
 
 “对象状态”和“模型数值计算”在这里有明确边界。调试时先确认所在步骤的数据类型，再判断是不是传错了内容。
 
-### 21.3 扩展讨论：新模型适配与多模态适配
+### 21.3 各核心模块负责什么：沿一条请求理解职责与协作
 
-理解了上面的完整请求链路后，可以进一步考虑：如果换一种模型架构，或者输入不再只有文字，哪些步骤需要改变？这里整理两个改造方向的评价与实施建议。
+这也是 [面试指南](NANO_VLLM_INTERVIEW_GUIDE_ZH.md) 中 Q003“各核心模块分别负责什么”的详细解释。这个问题实际是在问：**一次文本生成，需要哪些模块合作？每个模块负责哪一部分，又不负责哪一部分？**
 
-**结论：两个方向都有价值，但对当前学习和面试准备阶段，更建议先做“小型纯文本模型适配”，再考虑多模态。** 严格来说，它们主要是功能扩展，不一定意味着推理速度得到优化。以下是设计建议，**不是本仓库已经完成的适配，也不是已经测得的性能收益**。
+先分清两类工作：
 
-#### 21.3.1 先明确现状：不是“模型更新了，整个引擎就过时了”
+- **管理工作**：记录请求、安排顺序、管理缓存空间。
+- **计算工作**：执行模型、算出分数、选出下一个 token。
 
-“原项目的架构和现在的模型已经不一样”这个说法太笼统。当前仓库已经有 Qwen3 实现，真正的限制在于 [model_runner.py](nanovllm/engine/model_runner.py) 直接创建指定模型：
+下面用一条请求贯穿讲解：
+
+```text
+用户输入：我喜欢吃
+模型逐步生成：苹果。
+```
+
+文字切分与 token ID 都是教学假设，不代表真实 tokenizer 的结果。模块名称指不同职责，不意味着每个模块都独立运行在一个进程中。
+
+#### 21.3.1 LLMEngine：总入口，负责组织整个生成流程
+
+源码：[llm_engine.py](nanovllm/engine/llm_engine.py)。示例中调用 `llm.generate(prompts, sampling_params)`；`LLM` 在 [llm.py](nanovllm/llm.py) 继承 `LLMEngine`，主要功能由后者提供。
+
+可以把 LLMEngine 理解为**整个推理流程的协调者**，主要负责三件事：
+
+1. **准备运行对象**：组织配置，创建 Runner、tokenizer 和 Scheduler；多卡时启动其他 GPU 对应的进程。
+2. **接收输入、创建请求**：文字经 tokenizer 编码成整数编号列表，创建 Sequence 并加入等待队列。
+3. **推动计算、整理结果**：`generate()` 循环调用 `step()`，直到所有请求结束；然后恢复输入顺序，解码 completion，并返回结果。
+
+下面是 `add_request()` 中的连续节选：
 
 ```python
-# self 是 ModelRunner；hf_config 是加载的模型配置。
-# 这里固定按照 Qwen3 的结构创建模型，不会自动选择任意其他架构。
-self.model = Qwen3ForCausalLM(hf_config)
+# prompt 是本条输入；字符串需要编码，已有整数列表则不走这个分支。
+# self 是 LLMEngine；self.tokenizer 是引擎持有的编码/解码工具。
+if isinstance(prompt, str):
+    prompt = self.tokenizer.encode(prompt)
+# sampling_params 保存温度、生成上限等；seq 是新创建的单条请求记录。
+seq = Sequence(prompt, sampling_params)
+# 将请求加入 Scheduler 的 waiting 队列，此时还没有模型计算。
+self.scheduler.add(seq)
 ```
 
-模型更新，不一定都需要重写推理引擎：
+可以读作：**文字 → 整数编号列表 → 请求记录 → 等待队列**。引擎负责协调，但不亲自计算 Attention，也不亲自执行每个 GPU 数学运算。
 
-- **同架构、不同参数规模**：可能主要涉及配置和资源容量，但仍需核对目标配置与实现兼容性。
-- **不同架构**：可能涉及 Attention、归一化、位置编码、权重布局等变化。
-- **MoE、多模态等模型**：还可能引入新的执行和状态管理机制。
+#### 21.3.2 Sequence：一条请求的“记录卡”
 
-因此，适配之前应先回答：**目标模型与当前实现到底哪里不同？** 不能只根据模型名字新不新，就判断改造难度。
+源码：[sequence.py](nanovllm/engine/sequence.py)。假设输入被编码为 `[10,20,30]`，引擎创建一个 Sequence 对象代表这一条请求。它本身不会生成文字，而是保存生成中不断更新的信息。
 
-#### 21.3.2 方向一：适配新模型，不是只换一个模型路径
-
-支持另一种纯文本模型，至少需要核对下面这些内容：
-
-| 方面 | 要核对什么 |
-|---|---|
-| 模型结构 | Attention、MLP、残差和归一化顺序是否相同 |
-| Attention | Q/KV 头数、QK Norm、bias、mask 等是否一致 |
-| 位置编码 | RoPE 的实现、参数和扩展方式 |
-| 权重加载 | 文件中的参数名与代码中的参数是否对应 |
-| 配置 | hidden_size、head_dim、词表、dtype 等 |
-| 输入输出 | tokenizer、聊天模板、EOS 和权重共享 |
-
-一个具体例子是 [qwen3.py](nanovllm/models/qwen3.py) 中，当前 Qwen3 实现在没有 QKV bias 时会执行 Q/K 的 RMSNorm：
-
-```python
-# self 是 Qwen3Attention；qkv_bias 表示 QKV 投影是否使用偏置。
-# 这是当前 Qwen3 实现的模型逻辑，不是适用于所有模型的通用规则。
-if not self.qkv_bias:
-    # 对每个 query head 的最后一维归一化。
-    q = self.q_norm(q)
-    # 对每个 key head 的最后一维归一化。
-    k = self.k_norm(k)
-```
-
-如果另一个模型没有这两步，不能因为它也“没有 bias”，就直接套这份代码。否则即使权重能加载、程序能输出文字，计算也可能是错的。
-
-这个方向适合学习，因为它会迫使你把已有概念连接起来：**配置怎样变成结构，权重怎样装进结构，输入怎样进入网络，缓存怎样参与下一轮计算。** 相比完整多模态适配，范围通常更容易控制，也比只跑通 `example.py` 更能体现实际工程能力。
-
-#### 21.3.3 新模型怎么选、怎么实施、怎么验收？
-
-建议先选**小型、结构清楚、有官方参考实现的 dense 纯文本模型**，不必追最新的大模型。这里 dense 指普通稠密模型，不是需要额外专家路由的 MoE 架构。
-
-例如 SmolLM2-135M 的官方配置标明采用 `LlamaForCausalLM` 架构，可以作为候选学习目标。但这是“值得评估的适配对象”，**不是说它已经能在当前 Nano-vLLM 中直接正确运行**。[官方配置](https://huggingface.co/HuggingFaceTB/SmolLM2-135M/blob/main/config.json)
-
-建议按阶段完成：
-
-1. 先在单卡普通执行路径下支持目标模型，暂不处理多卡和手动 CUDA Graph。注意 `enforce_eager=True` 不会移除已有 `torch.compile` 装饰器。
-2. 对相同 token 输入，与官方参考实现比较 logits，按 dtype 设置合理数值容差。
-3. 检查 Prefill、缓存 Decode、多请求和停止条件，并确认原有 Qwen3 路径没有回归。
-4. 最后再验证图重放与多卡路径。
-
-**验收标准不能只有“能说话”。** 能生成正常文字，不足以证明权重映射、位置或缓存计算正确。基线实现、token 输入、配置和数值比较都应该可以复现。
-
-真正完成后，面试可以这样描述：
-
-> 我在原有 Qwen3 路径之外增加了另一种模型架构，处理了结构差异和权重映射，并通过参考 logits 与缓存路径测试验证。
-
-这是完成后的表达模板，不应在没有实现和测试时提前写进简历；它也比“换了一个模型下载地址”更有说服力。
-
-#### 21.3.4 方向二：多模态适配有价值，但工作量明显更大
-
-这里可以先将多模态理解为：**输入不仅有文字，还可能有图片等信息。** 例如输入“一张猫的图片 + 图片里有什么？”，模型输出图片描述。
-
-当前入口主要接受字符串或 token ID 列表。完整视觉模型还需要图片预处理和视觉特征计算；官方多模态接口通常由 Processor 处理文字与图片，而不只是普通 tokenizer。[官方多模态说明](https://huggingface.co/docs/transformers/en/chat_templating_multimodal)
-
-以将视觉特征融合进语言模型的架构为例，概念流程如下；不同模型的具体融合结构不同：
-
-```text
-图片 → 图片预处理 → 视觉编码器 → 视觉特征
-                                      ↓
-文字 → tokenizer → 文字特征 → 按模型规则融合
-                                      ↓
-                              语言模型生成回答
-```
-
-它影响的可能不只是 `qwen3.py`：
-
-| 链路中的位置 | 多模态可能需要增加或修改的内容 |
-|---|---|
-| 输入接口 | 怎样提交图片与文字，而不是只接受纯文本或 ID 列表 |
-| Sequence | 怎样保存图片相关元数据，并传递执行所需信息 |
-| ModelRunner | 怎样准备视觉特征与语言输入 |
-| 模型层 | 怎样按目标架构融合图文特征 |
-| 位置编码 | 怎样表达视觉位置及其与文字位置的关系 |
-| 调度与显存 | 视觉计算和展开后的序列占多少资源 |
-| 缓存策略 | 哪些内容可以安全复用，缓存身份如何定义 |
-
-例如 Qwen3-VL 的接口包含图像像素、图像网格信息和视觉特征相关输入，不能简单理解成“纯文本 Qwen3 加一个图片路径”。[官方模型接口](https://huggingface.co/docs/transformers/model_doc/qwen3_vl)
-
-#### 21.3.5 容易忽略的正确性问题：图片不同，不能错误复用前缀 KV
-
-当前 [BlockManager](nanovllm/engine/block_manager.py) 的前缀哈希主要基于：
-
-```text
-之前的块哈希 + 当前块的 token IDs
-```
-
-如果直接加入图片功能，却不调整缓存标识，可能出现：
-
-```text
-请求 A：图片 A + 相同问题
-请求 B：图片 B + 相同问题
-```
-
-两条请求即使使用了相同的图片占位 token，图片内容也可能不同，**不能因此复用同一份图文前缀 KV**。这是多模态扩展时的风险说明，不是当前纯文本代码已发生的图片缓存问题。
-
-适配时必须重新考虑：缓存身份是否正确包含了影响计算的图片内容、预处理配置等信息。具体如何表示这些信息，需按目标模型和输入处理方式设计。
-
-因此，多模态不是一个只修改输入格式的小功能，而是可能影响引擎正确性的系统扩展。
-
-#### 21.3.6 怎样限制多模态改造范围，避免同时承担太多问题？
-
-初次实现时建议限定为：**一个模型、单张图片、文字回答、单卡普通执行路径。** 先不同时支持视频、多图、音频、多卡、图捕获和跨请求视觉缓存。
-
-还要区分两种成果：
-
-- 用 Transformers 的 `generate()` 跑出图片回答：完成了多模态模型调用。
-- 将视觉输入接入 Nano-vLLM 自己的调度、语言计算和 KV 管理：才是更完整的引擎适配。
-
-两者都能学习，但简历上应如实区分，不能仅调用现成接口就说自己已经完成整个推理引擎的多模态改造。
-
-#### 21.3.7 当前阶段的选择与面试价值
-
-| 方向 | 主要收获 | 建议 |
+| 字段 | 保存什么 | 谁主要使用它 |
 |---|---|---|
-| 小型纯文本模型适配 | 模型结构、权重加载、缓存正确性、接口抽象 | 优先做 |
-| 多模态适配 | 视觉计算、图文融合、复杂输入与缓存管理 | 作为后续阶段 |
-| 已有链路的性能改进 | 瓶颈分析、实验设计、正确性与性能回归 | 若目标偏 AI Infra，同样值得优先考虑 |
+| `seq_id` | 请求编号，用于区分请求、恢复结果顺序 | LLMEngine |
+| `token_ids` | 原输入和已经生成的 token | Runner 读取，postprocess 通过 append_token 更新 |
+| `status` | WAITING、RUNNING 或 FINISHED | Scheduler |
+| `num_prompt_tokens` | 原输入 token 数，划分 prompt 与 completion | Sequence 属性与结果收集 |
+| `num_cached_tokens` | 已算出并缓存 KV 的 token 数 | Scheduler、Runner |
+| `num_scheduled_tokens` | 本轮计划计算的 token 数 | Scheduler 写入，Runner 读取 |
+| `block_table` | 当前请求使用的物理 KV 块编号列表 | BlockManager、Runner |
+| `temperature` | 本条请求的采样温度 | Runner 打包后传给 Sampler |
+| `max_tokens` | 最多新生成的 token 数 | Scheduler 判断结束 |
 
-对面试而言，重点不是功能名字够不够新，而是能否形成一个完整闭环：
+假设采样得到 40，Scheduler 调用 `seq.append_token(40)`；再生成 50 后：
 
 ```text
-发现限制 → 自己实现改动 → 验证正确性 → 测量效果 → 解释取舍
+初始 token_ids：   [10,20,30]
+第一轮追加后：     [10,20,30,40]
+第二轮追加后：     [10,20,30,40,50]
+
+Prompt：           [10,20,30]
+Completion：       [40,50]
 ```
 
-具体建议是：**先完成一个小型纯文本架构适配，建立参考结果对齐与回归测试；之后再决定做性能优化还是多模态。** 这样可以积累一项真实、边界清楚、可展示的代码贡献，也更容易把项目讲深。
+所以 Sequence 的作用是：**记住这条请求现在走到哪里，让其他模块能够接着处理。** 它不是模型，也不是保存全部 GPU 数值的大容器；尤其 `block_table` 保存的是块编号，不是 K/V 浮点数。单卡主进程内各模块通常使用同一个 Sequence 的引用，不是每轮都复制一份完整请求。
 
-进一步的改造计划可对照 [优化路线图](NANO_VLLM_OPTIMIZATION_ROADMAP_ZH.md)，面试表达与成果边界可对照 [面试指南](NANO_VLLM_INTERVIEW_GUIDE_ZH.md)。
+#### 21.3.3 Scheduler：决定“这一轮处理谁”
+
+源码：[scheduler.py](nanovllm/engine/scheduler.py)。同时有很多请求时，不能不考虑资源就全部送入 GPU。Scheduler 决定本轮选哪些请求、每条处理多少 token，以及走哪个阶段。
+
+它主要管理两个队列：
+
+```python
+# 这里 self 是 Scheduler，不是 LLMEngine 或 ModelRunner。
+# waiting 保存等待开始、继续 Prefill 或抢占后需要重算的请求。
+self.waiting: deque[Sequence] = deque()
+# running 保存已经进入生成过程、等待继续推进的请求。
+self.running: deque[Sequence] = deque()
+```
+
+引擎每轮调用 `seqs, is_prefill = self.scheduler.schedule()`：
+
+- `seqs` 是本轮选中的 Sequence 列表，不是已经生成的结果。
+- `is_prefill` 表示本批次是否走 Prefill 路径；False 时走 Decode。
+
+比如本轮选择请求 A、B 做 Prefill，下轮可能选择 A、C 做 Decode。当前实现先尝试 Prefill，选不到 Prefill 批次才选择 Decode，**不是两阶段混在同一批次中执行**。
+
+选择时会考虑请求数量限制、Prefill token 预算、KV 块容量、是否分段处理，以及是否需要抢占腾出空间。计划与缓存分配通过 BlockManager 协作完成。
+
+计算结束后，它还负责 `postprocess()`：更新缓存进度，将有效新 token 追加到对应 Sequence，检查 EOS 与 max_tokens；结束后移出 running 并释放块引用。未完成的 Prefill chunk 不追加临时采样结果。
+
+因此：**Scheduler 不只是排队，还负责生成后的状态管理；它决定谁来算，但模型与 Sampler 决定算出什么。**
+
+#### 21.3.4 BlockManager：管理“KV 数据放在哪里”
+
+源码：[block_manager.py](nanovllm/engine/block_manager.py)。历史 K/V 占用 GPU 显存，BlockManager 类似**仓库管理员**，记录哪些块空闲、哪些被使用、请求分到哪些块、哪些可共享、哪些前缀可复用以及结束后哪些块可回收。
+
+例如 `seq.block_table=[7,2]`，block_size=256：
+
+```text
+请求的第一个逻辑块 → 物理块 7 → 前 256 个 token 的 KV
+请求的第二个逻辑块 → 物理块 2 → 后续 token 的 KV
+```
+
+如果请求 A、B 共享同一前缀块 7，它的 ref_count 可以是 2。A 结束后降到 1，不能立即覆盖，因为 B 还在使用；最后一个引用释放后降到 0，块才能进入可回收集合。
+
+**重点：Python Block 对象不等于 GPU KV 数据。**
+
+| 对象或数据 | 保存内容 | 所处职责 |
+|---|---|---|
+| Python `Block` | block_id、ref_count、hash、token_ids | CPU 管理信息，像仓库登记表 |
+| `Sequence.block_table` | 一条请求的物理块 ID 列表 | 请求到缓存位置的映射 |
+| `ModelRunner.kv_cache` | 各层历史 K/V 的实际浮点数 | GPU 数据，像仓库里的货物 |
+
+真实 KV 张量由 Runner 分配，再将各层视图绑定到 Attention。BlockManager 管位置与引用，Attention 内的 GPU 算子负责实际写入、读取与计算。**BlockManager 不亲自计算 Attention。** 回收块也不意味着整个 GPU KV 池立即被释放，通常只是让对应位置可以再次使用。
+
+#### 21.3.5 ModelRunner：把调度计划变成 GPU 执行
+
+源码：[model_runner.py](nanovllm/engine/model_runner.py)。Scheduler 选出来的是 `list[Sequence]`，模型不能直接拿这些 Python 请求对象做矩阵运算。Runner 读取请求信息，准备 GPU 能处理的输入，再组织模型执行。
+
+下面是完整 `ModelRunner.run()`，加了教学注释：
+
+```python
+def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    # self 是 Runner；seqs 是本轮请求；按批次阶段提取 token、位置并设置 Context。
+    input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    # 主 rank 打包逐请求温度；其他 rank 不采样，因此使用 None。
+    temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+    # 组织 Qwen3 与 LM Head 计算；主 rank 最终获得完整词表 logits。
+    logits = self.run_model(input_ids, positions, is_prefill)
+    # 主 rank 为每条请求选一个 token，转成 Python 整数列表，交回 Scheduler。
+    token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+    # 清理本轮临时执行上下文；不是释放 KV 张量。
+    reset_context()
+    # 原源码标注 list[int]，但非零 rank 的实际返回值为 None。
+    return token_ids
+```
+
+可以分三步读：
+
+1. **准备输入**：从 Sequence 提取本轮 token IDs、位置、KV 写入槽、块表与历史长度，整理成 Tensor，并设置本轮 Context。
+2. **运行模型**：组织 Qwen3 和 LM Head，根据阶段与配置选择正常调用或更新缓冲后重放 CUDA Graph。
+3. **采样并返回**：主 rank 用 Sampler 选 token，把结果转为列表交回调度器；这里没有把结果解码成中文。
+
+初始化时 Runner 还负责选择 GPU、创建模型、加载权重、创建 Sampler、warmup、分配 KV 池、必要时捕获图，以及组织多进程控制与执行通信。
+
+所以：**Scheduler 说“本轮处理这些请求”，Runner 负责“怎样把本轮请求送进 GPU 执行”。** Runner 是执行桥梁，不等于它自己重写了每个模型算子。
+
+#### 21.3.6 Qwen3：实际执行神经网络计算
+
+源码：[qwen3.py](nanovllm/models/qwen3.py)。Qwen3 是链路中的模型计算部分，接收 token ID 和位置，执行：
+
+```text
+Embedding
+    → 多层 Decoder Layer
+        → RMSNorm
+        → Attention
+        → 残差与归一化
+        → MLP
+    → 最终归一化
+    → hidden states
+```
+
+随后 `compute_logits()` 调用 LM Head，把每条请求用于预测的特征映射成词表分数：
+
+```text
+用于预测的 hidden states：[B,H]
+    → LM Head
+候选 token 的 logits：    [B,V]
+```
+
+B 是本轮请求数，H 是隐藏维度，V 是完整词表大小。Prefill 先从 `[T,H]` 选每条请求最后一个 query 位置，才得到这里的 `[B,H]`；不能忽略这步就以为总输入 token 数等于请求数。
+
+假设三个候选 token 的分数分别是“苹果：3.0、香蕉：2.0、米饭：1.0”，模型负责给出这些 logits，但**此时还没有选定最终输出哪个 token**。
+
+Attention 执行时通过对应算子写入本轮 K/V，并读取历史缓存参与计算。Qwen3 不管理 waiting 队列、不为请求分配物理 KV 块；它根据准备好的输入和缓存信息执行网络。
+
+#### 21.3.7 Sampler：从候选分数中选下一个 token
+
+源码：[sampler.py](nanovllm/layers/sampler.py)。**模型负责打分，Sampler 负责选择。** 它接收 `[B,V]` logits 和 `[B]` temperatures，调整分数、计算概率并随机选择，返回 `[B]` 整数 Tensor。
+
+比如两条请求本轮返回 token IDs `[40,80]`，意思是请求 A 的下一个 ID 为 40、请求 B 的下一个 ID 为 80，不是 A 一次生成两个 token。单卡或主 rank 的 Runner 将张量转成列表后，交给 Scheduler 写回请求。
+
+Sampler 不负责修改队列、判断整条请求是否达到输出上限、分配 KV 块或解码中文。**选出一个新 token，也不意味着整段回答已经结束**；引擎还要继续推动下一轮，直到调度器判定结束。
+
+#### 21.3.8 七个模块怎样沿一条请求合作？
+
+将“我喜欢吃”的教学例子完整走一遍：
+
+1. **LLMEngine** 收到文字，tokenizer 编码为假设的 `[10,20,30]`。
+2. **Sequence** 保存输入、初始状态和生成策略。
+3. **Scheduler** 从 waiting 选中它，安排 Prefill。
+4. **BlockManager** 分配或复用它需要的 KV 块。
+5. **ModelRunner** 将本轮输入与缓存信息准备为 GPU 可执行数据。
+6. **Qwen3 / Attention** 执行网络、写入 KV；LM Head 给出候选分数。
+7. **Sampler** 选出假设的 token 40。
+8. **Scheduler** 将 40 追加到 Sequence，更新进度并判断结束条件。
+9. 如果未结束，下一轮调度 Decode，以刚生成的尾 token 为输入，继续计算。
+10. 最终 **LLMEngine** 收集 Completion，用 tokenizer 解码并返回文字。
+
+主干可简化为：
+
+```text
+引擎接收 → 请求记录 → 调度与缓存管理 → Runner 准备执行
+    → 模型计算 → 采样 → 更新请求 → 下一轮或结束
+```
+
+这里“Sequence 记录”不是一个主动执行的阶段，而是后面各模块共同读取、更新的状态。计算期间的 K/V 写入由 Attention 路径完成，后处理再更新 Sequence 的缓存计数；两者不要混成同一个动作。
+
+#### 21.3.9 面试时怎样把职责说清楚？
+
+理解之后，可以用下面的回答，不必把所有细节一次背完：
+
+> Nano-vLLM 把请求管理和模型计算分开了。LLMEngine 接收输入、推动生成循环并整理结果；每条请求用 Sequence 保存 token、状态和缓存进度；Scheduler 根据阶段、预算和资源选择本轮批次，并在计算后更新请求。
+>
+> BlockManager 管理 KV 块的分配、引用和前缀复用，但不直接计算 Attention。ModelRunner 把请求打包为 GPU 输入，管理模型执行、缓存张量和多进程控制。Qwen3 执行网络，LM Head 给出 logits，Sampler 选下一 token，交回调度器继续推进。
+>
+> CPU 的 Block 管理对象与 GPU 的 KV 张量是两回事：前者记录位置和使用关系，后者保存真实 K/V 数值。
+
+最简记忆法：**Engine 组织，Sequence 记录，Scheduler 安排，BlockManager 管空间，Runner 执行，Qwen3 算分数，Sampler 做选择。**
 
 ---
 
