@@ -6,7 +6,7 @@
 > 本次修订：2026-10-09。在源码调用链基础上，给全部 Python 代码块补充逐行解释，并增加参数、变量、函数和常用操作查阅。
 > 源码基线：修订开始时的提交 `2a8302a`；本次只修改教学文档，不修改推理代码。
 > 补充修订：2026-10-10。扩写 16.3 节 RMSNorm，新增 19.9 节 NCCL，并在 20.3 节补充 torch.compile 入门解释。
-> 补充修订：2026-10-12。在第 21 章补充各核心模块的职责、协作流程与面试讲解。
+> 补充修订：2026-10-12。在第 21 章补充核心模块职责，以及内部计算、支撑组件、执行机制与外部依赖的分类总结。
 
 ## 怎样使用这份笔记
 
@@ -52,6 +52,7 @@
 - [20. CUDA Graph 与 torch.compile](#20-cuda-graph-与-torchcompile)
 - [21. 一次请求的完整时序复盘](#21-一次请求的完整时序复盘)
   - [21.3 各核心模块负责什么：沿一条请求理解职责与协作](#213-各核心模块负责什么沿一条请求理解职责与协作)
+  - [21.4 其他计算与支撑组件、执行机制和外部依赖总结](#214-其他计算与支撑组件执行机制和外部依赖总结)
 - [22. Benchmark 怎么读、怎么测](#22-benchmark-怎么读怎么测)
 - [23. 推荐的源码阅读和调试路线](#23-推荐的源码阅读和调试路线)
 - [24. 常见报错与排查](#24-常见报错与排查)
@@ -4791,6 +4792,112 @@ Sampler 不负责修改队列、判断整条请求是否达到输出上限、分
 > CPU 的 Block 管理对象与 GPU 的 KV 张量是两回事：前者记录位置和使用关系，后者保存真实 K/V 数值。
 
 最简记忆法：**Engine 组织，Sequence 记录，Scheduler 安排，BlockManager 管空间，Runner 执行，Qwen3 算分数，Sampler 做选择。**
+
+### 21.4 其他计算与支撑组件、执行机制和外部依赖总结
+
+21.3 的七个模块是按请求生成主流程归纳的职责单元，**不是项目只有七个模块，也不是七个模块都处于同一层级**。例如 Qwen3 内部还有 Attention、MLP 等计算组件；Runner 既调用模型，又依赖 CUDA、通信与执行优化机制。
+
+本节按作用归纳，帮助你知道“还需要认识什么、在哪里详细讲过”。这些分类不是严格互斥：并行 Linear 既参与模型计算，又涉及张量并行；FlashAttention 既是外部依赖，又承担 Attention 计算。
+
+#### 21.4.1 内部计算组件：模型怎样把输入变成候选分数？
+
+| 组件 | 做什么、处理什么 | 与主流程的关系 | 详细讲解与源码 |
+|---|---|---|---|
+| **Embedding** | 将整数 token ID 查表转换为浮点特征，常见 `[T] → [T,H]` | Qwen3Model 的输入环节，不是 tokenizer | 15.4、19.4；[embed_head.py](nanovllm/layers/embed_head.py) |
+| **Linear 投影** | 执行特征的线性变换，如 QKV、Gate/Up、Down、输出投影 | Attention/MLP/LM Head 的基础计算；并行版本按权重维切分 | 15.2～15.3、19.2～19.3；[linear.py](nanovllm/layers/linear.py) |
+| **Attention** | 当前 Q 匹配允许范围内的 K，按注意力权重汇聚 V；同时组织本轮 KV 写入与历史读取 | 在每个 Decoder Layer 中调用，利用 Runner 准备的 Context 与 KV 视图 | 16.5～16.7；[attention.py](nanovllm/layers/attention.py) |
+| **RoPE** | 根据位置旋转 Q/K，融入位置信息，不负责排列文字 | Qwen3Attention 中、实际 Attention 计算之前调用 | 16.1、16.8；[rotary_embedding.py](nanovllm/layers/rotary_embedding.py) |
+| **RMSNorm / QK Norm** | 按均方根调整最后一维特征尺度，再乘逐维权重；QK Norm 是将 RMSNorm 用在 Q/K 上 | Decoder Layer、final norm，以及当前配置下的 Q/K 归一化 | 16.2～16.3、16.8；[layernorm.py](nanovllm/layers/layernorm.py) |
+| **MLP / SiluAndMul** | MLP 先算 Gate/Up，激活模块计算 `SiLU(gate) × up`，再 Down 投影 | Decoder Layer 的另一条主要计算路径；激活不是整个 MLP | 15.3、16.4、16.9；[qwen3.py](nanovllm/models/qwen3.py)、[activation.py](nanovllm/layers/activation.py) |
+| **残差连接** | 保留主干并把子层增量加回；不是重新编码 token | hidden_states 与 residual 分开传递，部分加法与 RMSNorm 一起执行 | 15.7、16.3；[qwen3.py](nanovllm/models/qwen3.py)、[layernorm.py](nanovllm/layers/layernorm.py) |
+| **LM Head** | 将用于预测的特征投影成词表分数，`[B,H] → [B,V]`；Prefill 先选每条请求末 query 行 | 网络计算之后、Sampler 之前；不负责最终选 token | 15.4、17.5、19.4；[embed_head.py](nanovllm/layers/embed_head.py) |
+
+这里 B 是本轮请求数、T 是打包的输入 token 总数、H 是 hidden_size、V 是词表大小。Attention 中的 Value 也叫 V，但不是这里的词表维 V。
+
+最容易混淆的两对：**Tokenizer 处理文字与编号，Embedding 处理编号与向量；LM Head 给候选分数，Sampler 做选择。**
+
+#### 21.4.2 支撑组件：配置、加载和执行信息从哪里来？
+
+| 组件 | 保存或完成什么 | 谁创建或使用 | 详细讲解与源码 |
+|---|---|---|---|
+| **Tokenizer / 聊天模板** | 将文字编码为 token IDs，将生成 IDs 解码；模板组织角色与生成提示 | 示例与 LLMEngine 使用 Transformers 的 AutoTokenizer | 2.3、6.2、6.4；[example.py](example.py)、[llm_engine.py](nanovllm/engine/llm_engine.py) |
+| **Config / AutoConfig** | Config 保存引擎预算、TP、块大小等；hf_config 提供模型层数、头数、dtype 等 | LLMEngine 构造，Runner/Scheduler 接收；不是模型权重本身 | 第 10 章；[config.py](nanovllm/config.py) |
+| **SamplingParams** | 单条请求的温度、输出上限、ignore_eos 策略，不是 GPU 资源预算 | 用户创建，Sequence 复制字段；Runner/Scheduler 后续读取 | 6.3、28.2、28.4；[sampling_params.py](nanovllm/sampling_params.py) |
+| **权重加载器** | 读取 safetensors，按参数名、打包映射与本卡分片复制训练后的数值 | Runner 初始化调用 load_model，参数专属 weight_loader 决定切片位置 | 第 18 章；[loader.py](nanovllm/utils/loader.py)、[linear.py](nanovllm/layers/linear.py) |
+| **Context** | 本轮模式、累计序列边界、slot_mapping、context_lens、block_tables 等元数据 | Runner 设置，Attention/LM Head 读取，每轮执行后重置 | 14.5、14.10、28.8；[context.py](nanovllm/utils/context.py) |
+| **Block 与 GPU KV 池** | Block 保存引用/哈希等管理信息；KV 池保存实际历史 K/V 数值 | BlockManager 管块元数据，Runner 分配 GPU 池，Attention 使用各层视图 | 13.2～13.3、13.9、14.11；[block_manager.py](nanovllm/engine/block_manager.py)、[model_runner.py](nanovllm/engine/model_runner.py) |
+
+注意三个边界：
+
+- Config 的 AutoConfig 能读取模型配置，不表示该引擎自动支持所有架构。
+- Context 是本轮 Attention 执行信息，不是 Sequence，也不是 Python `with` 上下文管理器；它不负责保存整份 KV 浮点数据。
+- 权重加载通常属于引擎初始化，不是每生成一个 token 就重新从磁盘读模型；每轮重置 Context，也不等于清空模型或 KV 池。
+
+#### 21.4.3 执行机制与外部依赖：计算靠什么运行、优化和通信？
+
+| 名称 | 类型与本项目中的作用 | 不要误认为 | 详细位置 |
+|---|---|---|---|
+| **PyTorch** | 张量和 nn.Module 框架，提供模型参数、算子、推理模式等接口 | 模型权重本身，或完整的 Nano-vLLM 调度器 | 2.12；模型与 layers 源码 |
+| **CUDA** | NVIDIA GPU 执行相关的基础设施；CUDA Tensor 表示设备上的数据 | CUDA Graph、NCCL 的同义词 | 2.9、第 4～5 章；[model_runner.py](nanovllm/engine/model_runner.py) |
+| **torch.compile** | PyTorch 的编译优化机制；本项目用于 Norm、RoPE、激活、采样等局部计算 | 重新训练模型，或关闭 eager 后才存在 | 20.3；layers 中的装饰器 |
+| **CUDA Graph** | 记录并重放 GPU 执行流程，减少重复提交开销 | 复用上一次答案，或包含全部生成流程 | 第 20 章；[model_runner.py](nanovllm/engine/model_runner.py) |
+| **FlashAttention** | 外部 Attention 算子库；Prefill 调用 varlen 接口，Decode 调用 with_kvcache 接口 | 本项目的 BlockManager，或自定义写缓存 kernel | 16.5～16.7；[attention.py](nanovllm/layers/attention.py) |
+| **Triton** | GPU kernel 编写/编译工具；当前自定义 store_kvcache_kernel 把 K/V 写入物理槽 | 已经手写了完整 FlashAttention | 16.7、28.10；[attention.py](nanovllm/layers/attention.py) |
+| **torch.distributed / NCCL** | dist 是 Python 通信接口；nccl 是 GPU 通信后端，用于结果求和、词表收集及同步 | 启动 Python 子进程，或网络 HTTP 服务 | 第 19 章，尤其 19.9 |
+| **multiprocessing / 共享内存 / Event** | 启动 worker；传方法名、Sequence 快照；通知 worker 读取控制消息 | 用这条控制通道传输所有 GPU hidden states | 19.6、19.8；[llm_engine.py](nanovllm/engine/llm_engine.py)、[model_runner.py](nanovllm/engine/model_runner.py) |
+| **Transformers** | 提供配置、tokenizer 和聊天模板等工具；当前实际网络由本地 Qwen3 代码执行 | 本项目完全调用 Transformers generate 完成所有推理 | 第 6、10、15 章 |
+| **Safetensors** | 模型权重存储与读取工具；safe_open 读取参数 | tokenizer 编码格式，或 KV 缓存格式 | 第 18 章；[loader.py](nanovllm/utils/loader.py) |
+| **xxhash / NumPy** | 前者算前缀哈希，后者将 token 列表组织为数组字节供哈希使用 | 神经网络生成 token 的计算器 | 13.6、28.6；[block_manager.py](nanovllm/engine/block_manager.py) |
+
+补充两条执行边界：
+
+- `enforce_eager=True` 关闭 Runner 的手动 CUDA Graph 路径，不移除局部 `torch.compile`，也不关闭 FlashAttention 或 KV Cache。
+- 当前手动图捕获模型主体，LM Head 在 replay 后执行，Sampler 又在后面执行；因此“一次 replay”不等于“从输入到完整回答的一切都结束”。
+
+#### 21.4.4 持有关系与调用关系：不要把所有名字摆成一排
+
+下面是简化的主要对象持有关系。Sequence 由引擎创建并进入 Scheduler 队列；每个 GPU rank 有自己的 Runner 与模型执行对象。
+
+```text
+LLMEngine
+├── tokenizer
+├── Scheduler
+│   ├── waiting / running → Sequence 请求对象
+│   └── BlockManager → Block 管理对象
+└── ModelRunner（每个 rank）
+    ├── Qwen3ForCausalLM
+    │   ├── Qwen3Model
+    │   │   ├── Embedding
+    │   │   ├── 多层 Decoder Layer → Norm / Attention / MLP
+    │   │   └── final Norm
+    │   └── LM Head
+    ├── Sampler
+    └── GPU KV 池 → 各层 Attention 持有相应视图
+```
+
+这是**谁持有谁**，不是“每一层依次执行”的顺序图。实际计算顺序可按下面串联：
+
+```text
+初始化：Config / 模型配置 → Runner 创建模型 → 加载权重 → 准备缓存与可选图
+
+生成：Tokenizer → Sequence → Scheduler / BlockManager
+    → Runner 准备 input_ids、positions 与 Context
+    → Embedding → Decoder Layers（Norm、QKV、RoPE、Attention、MLP）→ final Norm
+    → LM Head → Sampler → Scheduler 更新 Sequence
+    → 下一轮，或完成后 Tokenizer 解码
+```
+
+FlashAttention/Triton 位于相关 GPU 计算与缓存写入环节；TP 通信发生在需要合并分片结果的层中；compile/图是执行优化机制。它们不是在上述链路末尾再依次调用的一组业务模块。
+
+#### 21.4.5 对应章节与面试记忆法
+
+推荐阅读顺序：**第 8、21 章掌握全流程 → 第 11～17 章深入请求、调度、缓存与计算 → 第 18～20 章理解加载、多卡与执行优化**。参数看不懂时查第 28 章；Tokenizer、配置和采样策略分别回看第 2、6、10 章。
+
+面试中可以这样总结：
+
+> 七个模块说明请求主流程的分工；模型内部由 Embedding、投影、Attention、RoPE、Norm、MLP 和 LM Head 完成数值计算。Tokenizer、配置、权重加载器和 Context 提供输入转换及执行信息。PyTorch/CUDA 支撑计算，FlashAttention/Triton 执行相关算子，compile/CUDA Graph 优化执行，dist/NCCL 与多进程控制支撑多卡协作。
+
+不必把每个依赖都背成一个“核心模块”。看到任何名字，先回答：**它属于哪个层次，解决什么问题，谁调用它，输入输出是什么，当前项目具体用了哪部分。**
 
 ---
 
