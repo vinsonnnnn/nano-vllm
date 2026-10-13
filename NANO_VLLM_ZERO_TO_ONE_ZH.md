@@ -2360,7 +2360,6 @@ def append_token(self, token_id: int):
 
 最后一行的缓存数量是 **0**，不是 4：`BlockManager.deallocate()` 重置计数并清空块表。token 列表仍在，所以引擎可以提取 `[40,50]` 作为结果。若在断点里看到已完成请求的空块表，不要误以为没有分配过缓存。
 
-
 ---
 
 ## 12. 调度器 Scheduler 与连续批处理
@@ -2873,6 +2872,15 @@ block_tables   = [每条序列的物理块表]
 
 ### 14.5 Context 的作用
 
+但 Attention 不能只知道“这里有 5 个 token”，它还需要知道：
+
+- 哪些 token 属于 A，哪些属于 B？不能让两个独立请求互相关注。
+- 本轮是 Prefill，还是 Decode？
+- 每个请求需要读取多少历史 KV？
+- 新计算出来的 KV 应该写到哪里？
+- 请求的历史 KV 分布在哪些物理 block 中？
+  这些信息就放在 Context 里面。
+
 `utils/context.py` 保存当前 forward 的临时元数据。这样 Qwen3 的每一层只需接收：
 
 ```python
@@ -2883,6 +2891,12 @@ input_ids, positions
 Attention 和 LM Head 可以通过 `get_context()` 取得 KV Cache 映射、序列边界等信息，而不用在几十层调用中反复传递一长串参数。
 
 它是每个进程内的全局变量，因此这种实现默认同一个进程不会并发执行两次模型 forward。
+
+input_ids、positions：
+    本轮要计算的输入数据。
+
+Context：
+    告诉相关计算组件，应该怎样组织和处理这些输入。
 
 ### 14.6 run
 
@@ -4759,16 +4773,16 @@ Sampler 不负责修改队列、判断整条请求是否达到输出上限、分
 
 #### 21.4.1 内部计算组件：模型怎样把输入变成候选分数？
 
-| 组件 | 做什么、处理什么 | 与主流程的关系 | 详细讲解与源码 |
-|---|---|---|---|
-| **Embedding** | 将整数 token ID 查表转换为浮点特征，常见 `[T] → [T,H]` | Qwen3Model 的输入环节，不是 tokenizer | 15.4、19.4；[embed_head.py](nanovllm/layers/embed_head.py) |
-| **Linear 投影** | 执行特征的线性变换，如 QKV、Gate/Up、Down、输出投影 | Attention/MLP/LM Head 的基础计算；并行版本按权重维切分 | 15.2～15.3、19.2～19.3；[linear.py](nanovllm/layers/linear.py) |
-| **Attention** | 当前 Q 匹配允许范围内的 K，按注意力权重汇聚 V；同时组织本轮 KV 写入与历史读取 | 在每个 Decoder Layer 中调用，利用 Runner 准备的 Context 与 KV 视图 | 16.5～16.7；[attention.py](nanovllm/layers/attention.py) |
-| **RoPE** | 根据位置旋转 Q/K，融入位置信息，不负责排列文字 | Qwen3Attention 中、实际 Attention 计算之前调用 | 16.1、16.8；[rotary_embedding.py](nanovllm/layers/rotary_embedding.py) |
-| **RMSNorm / QK Norm** | 按均方根调整最后一维特征尺度，再乘逐维权重；QK Norm 是将 RMSNorm 用在 Q/K 上 | Decoder Layer、final norm，以及当前配置下的 Q/K 归一化 | 16.2～16.3、16.8；[layernorm.py](nanovllm/layers/layernorm.py) |
-| **MLP / SiluAndMul** | MLP 先算 Gate/Up，激活模块计算 `SiLU(gate) × up`，再 Down 投影 | Decoder Layer 的另一条主要计算路径；激活不是整个 MLP | 15.3、16.4、16.9；[qwen3.py](nanovllm/models/qwen3.py)、[activation.py](nanovllm/layers/activation.py) |
-| **残差连接** | 保留主干并把子层增量加回；不是重新编码 token | hidden_states 与 residual 分开传递，部分加法与 RMSNorm 一起执行 | 15.7、16.3；[qwen3.py](nanovllm/models/qwen3.py)、[layernorm.py](nanovllm/layers/layernorm.py) |
-| **LM Head** | 将用于预测的特征投影成词表分数，`[B,H] → [B,V]`；Prefill 先选每条请求末 query 行 | 网络计算之后、Sampler 之前；不负责最终选 token | 15.4、17.5、19.4；[embed_head.py](nanovllm/layers/embed_head.py) |
+| 组件                        | 做什么、处理什么                                                                    | 与主流程的关系                                                     | 详细讲解与源码                                                                                       |
+| --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| **Embedding**         | 将整数 token ID 查表转换为浮点特征，常见`[T] → [T,H]`                            | Qwen3Model 的输入环节，不是 tokenizer                              | 15.4、19.4；[embed_head.py](nanovllm/layers/embed_head.py)                                            |
+| **Linear 投影**       | 执行特征的线性变换，如 QKV、Gate/Up、Down、输出投影                                 | Attention/MLP/LM Head 的基础计算；并行版本按权重维切分             | 15.2～15.3、19.2～19.3；[linear.py](nanovllm/layers/linear.py)                                        |
+| **Attention**         | 当前 Q 匹配允许范围内的 K，按注意力权重汇聚 V；同时组织本轮 KV 写入与历史读取       | 在每个 Decoder Layer 中调用，利用 Runner 准备的 Context 与 KV 视图 | 16.5～16.7；[attention.py](nanovllm/layers/attention.py)                                              |
+| **RoPE**              | 根据位置旋转 Q/K，融入位置信息，不负责排列文字                                      | Qwen3Attention 中、实际 Attention 计算之前调用                     | 16.1、16.8；[rotary_embedding.py](nanovllm/layers/rotary_embedding.py)                                |
+| **RMSNorm / QK Norm** | 按均方根调整最后一维特征尺度，再乘逐维权重；QK Norm 是将 RMSNorm 用在 Q/K 上        | Decoder Layer、final norm，以及当前配置下的 Q/K 归一化             | 16.2～16.3、16.8；[layernorm.py](nanovllm/layers/layernorm.py)                                        |
+| **MLP / SiluAndMul**  | MLP 先算 Gate/Up，激活模块计算`SiLU(gate) × up`，再 Down 投影                    | Decoder Layer 的另一条主要计算路径；激活不是整个 MLP               | 15.3、16.4、16.9；[qwen3.py](nanovllm/models/qwen3.py)、[activation.py](nanovllm/layers/activation.py) |
+| **残差连接**          | 保留主干并把子层增量加回；不是重新编码 token                                        | hidden_states 与 residual 分开传递，部分加法与 RMSNorm 一起执行    | 15.7、16.3；[qwen3.py](nanovllm/models/qwen3.py)、[layernorm.py](nanovllm/layers/layernorm.py)         |
+| **LM Head**           | 将用于预测的特征投影成词表分数，`[B,H] → [B,V]`；Prefill 先选每条请求末 query 行 | 网络计算之后、Sampler 之前；不负责最终选 token                     | 15.4、17.5、19.4；[embed_head.py](nanovllm/layers/embed_head.py)                                      |
 
 这里 B 是本轮请求数、T 是打包的输入 token 总数、H 是 hidden_size、V 是词表大小。Attention 中的 Value 也叫 V，但不是这里的词表维 V。
 
@@ -4776,14 +4790,14 @@ Sampler 不负责修改队列、判断整条请求是否达到输出上限、分
 
 #### 21.4.2 支撑组件：配置、加载和执行信息从哪里来？
 
-| 组件 | 保存或完成什么 | 谁创建或使用 | 详细讲解与源码 |
-|---|---|---|---|
-| **Tokenizer / 聊天模板** | 将文字编码为 token IDs，将生成 IDs 解码；模板组织角色与生成提示 | 示例与 LLMEngine 使用 Transformers 的 AutoTokenizer | 2.3、6.2、6.4；[example.py](example.py)、[llm_engine.py](nanovllm/engine/llm_engine.py) |
-| **Config / AutoConfig** | Config 保存引擎预算、TP、块大小等；hf_config 提供模型层数、头数、dtype 等 | LLMEngine 构造，Runner/Scheduler 接收；不是模型权重本身 | 第 10 章；[config.py](nanovllm/config.py) |
-| **SamplingParams** | 单条请求的温度、输出上限、ignore_eos 策略，不是 GPU 资源预算 | 用户创建，Sequence 复制字段；Runner/Scheduler 后续读取 | 6.3、28.2、28.4；[sampling_params.py](nanovllm/sampling_params.py) |
-| **权重加载器** | 读取 safetensors，按参数名、打包映射与本卡分片复制训练后的数值 | Runner 初始化调用 load_model，参数专属 weight_loader 决定切片位置 | 第 18 章；[loader.py](nanovllm/utils/loader.py)、[linear.py](nanovllm/layers/linear.py) |
-| **Context** | 本轮模式、累计序列边界、slot_mapping、context_lens、block_tables 等元数据 | Runner 设置，Attention/LM Head 读取，每轮执行后重置 | 14.5、14.10、28.8；[context.py](nanovllm/utils/context.py) |
-| **Block 与 GPU KV 池** | Block 保存引用/哈希等管理信息；KV 池保存实际历史 K/V 数值 | BlockManager 管块元数据，Runner 分配 GPU 池，Attention 使用各层视图 | 13.2～13.3、13.9、14.11；[block_manager.py](nanovllm/engine/block_manager.py)、[model_runner.py](nanovllm/engine/model_runner.py) |
+| 组件                           | 保存或完成什么                                                            | 谁创建或使用                                                        | 详细讲解与源码                                                                                                                  |
+| ------------------------------ | ------------------------------------------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| **Tokenizer / 聊天模板** | 将文字编码为 token IDs，将生成 IDs 解码；模板组织角色与生成提示           | 示例与 LLMEngine 使用 Transformers 的 AutoTokenizer                 | 2.3、6.2、6.4；[example.py](example.py)、[llm_engine.py](nanovllm/engine/llm_engine.py)                                           |
+| **Config / AutoConfig**  | Config 保存引擎预算、TP、块大小等；hf_config 提供模型层数、头数、dtype 等 | LLMEngine 构造，Runner/Scheduler 接收；不是模型权重本身             | 第 10 章；[config.py](nanovllm/config.py)                                                                                        |
+| **SamplingParams**       | 单条请求的温度、输出上限、ignore_eos 策略，不是 GPU 资源预算              | 用户创建，Sequence 复制字段；Runner/Scheduler 后续读取              | 6.3、28.2、28.4；[sampling_params.py](nanovllm/sampling_params.py)                                                               |
+| **权重加载器**           | 读取 safetensors，按参数名、打包映射与本卡分片复制训练后的数值            | Runner 初始化调用 load_model，参数专属 weight_loader 决定切片位置   | 第 18 章；[loader.py](nanovllm/utils/loader.py)、[linear.py](nanovllm/layers/linear.py)                                           |
+| **Context**              | 本轮模式、累计序列边界、slot_mapping、context_lens、block_tables 等元数据 | Runner 设置，Attention/LM Head 读取，每轮执行后重置                 | 14.5、14.10、28.8；[context.py](nanovllm/utils/context.py)                                                                       |
+| **Block 与 GPU KV 池**   | Block 保存引用/哈希等管理信息；KV 池保存实际历史 K/V 数值                 | BlockManager 管块元数据，Runner 分配 GPU 池，Attention 使用各层视图 | 13.2～13.3、13.9、14.11；[block_manager.py](nanovllm/engine/block_manager.py)、[model_runner.py](nanovllm/engine/model_runner.py) |
 
 注意三个边界：
 
@@ -4793,19 +4807,19 @@ Sampler 不负责修改队列、判断整条请求是否达到输出上限、分
 
 #### 21.4.3 执行机制与外部依赖：计算靠什么运行、优化和通信？
 
-| 名称 | 类型与本项目中的作用 | 不要误认为 | 详细位置 |
-|---|---|---|---|
-| **PyTorch** | 张量和 nn.Module 框架，提供模型参数、算子、推理模式等接口 | 模型权重本身，或完整的 Nano-vLLM 调度器 | 2.12；模型与 layers 源码 |
-| **CUDA** | NVIDIA GPU 执行相关的基础设施；CUDA Tensor 表示设备上的数据 | CUDA Graph、NCCL 的同义词 | 2.9、第 4～5 章；[model_runner.py](nanovllm/engine/model_runner.py) |
-| **torch.compile** | PyTorch 的编译优化机制；本项目用于 Norm、RoPE、激活、采样等局部计算 | 重新训练模型，或关闭 eager 后才存在 | 20.3；layers 中的装饰器 |
-| **CUDA Graph** | 记录并重放 GPU 执行流程，减少重复提交开销 | 复用上一次答案，或包含全部生成流程 | 第 20 章；[model_runner.py](nanovllm/engine/model_runner.py) |
-| **FlashAttention** | 外部 Attention 算子库；Prefill 调用 varlen 接口，Decode 调用 with_kvcache 接口 | 本项目的 BlockManager，或自定义写缓存 kernel | 16.5～16.7；[attention.py](nanovllm/layers/attention.py) |
-| **Triton** | GPU kernel 编写/编译工具；当前自定义 store_kvcache_kernel 把 K/V 写入物理槽 | 已经手写了完整 FlashAttention | 16.7、28.10；[attention.py](nanovllm/layers/attention.py) |
-| **torch.distributed / NCCL** | dist 是 Python 通信接口；nccl 是 GPU 通信后端，用于结果求和、词表收集及同步 | 启动 Python 子进程，或网络 HTTP 服务 | 第 19 章，尤其 19.9 |
-| **multiprocessing / 共享内存 / Event** | 启动 worker；传方法名、Sequence 快照；通知 worker 读取控制消息 | 用这条控制通道传输所有 GPU hidden states | 19.6、19.8；[llm_engine.py](nanovllm/engine/llm_engine.py)、[model_runner.py](nanovllm/engine/model_runner.py) |
-| **Transformers** | 提供配置、tokenizer 和聊天模板等工具；当前实际网络由本地 Qwen3 代码执行 | 本项目完全调用 Transformers generate 完成所有推理 | 第 6、10、15 章 |
-| **Safetensors** | 模型权重存储与读取工具；safe_open 读取参数 | tokenizer 编码格式，或 KV 缓存格式 | 第 18 章；[loader.py](nanovllm/utils/loader.py) |
-| **xxhash / NumPy** | 前者算前缀哈希，后者将 token 列表组织为数组字节供哈希使用 | 神经网络生成 token 的计算器 | 13.6、28.6；[block_manager.py](nanovllm/engine/block_manager.py) |
+| 名称                                         | 类型与本项目中的作用                                                           | 不要误认为                                        | 详细位置                                                                                                     |
+| -------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| **PyTorch**                            | 张量和 nn.Module 框架，提供模型参数、算子、推理模式等接口                      | 模型权重本身，或完整的 Nano-vLLM 调度器           | 2.12；模型与 layers 源码                                                                                     |
+| **CUDA**                               | NVIDIA GPU 执行相关的基础设施；CUDA Tensor 表示设备上的数据                    | CUDA Graph、NCCL 的同义词                         | 2.9、第 4～5 章；[model_runner.py](nanovllm/engine/model_runner.py)                                           |
+| **torch.compile**                      | PyTorch 的编译优化机制；本项目用于 Norm、RoPE、激活、采样等局部计算            | 重新训练模型，或关闭 eager 后才存在               | 20.3；layers 中的装饰器                                                                                      |
+| **CUDA Graph**                         | 记录并重放 GPU 执行流程，减少重复提交开销                                      | 复用上一次答案，或包含全部生成流程                | 第 20 章；[model_runner.py](nanovllm/engine/model_runner.py)                                                  |
+| **FlashAttention**                     | 外部 Attention 算子库；Prefill 调用 varlen 接口，Decode 调用 with_kvcache 接口 | 本项目的 BlockManager，或自定义写缓存 kernel      | 16.5～16.7；[attention.py](nanovllm/layers/attention.py)                                                      |
+| **Triton**                             | GPU kernel 编写/编译工具；当前自定义 store_kvcache_kernel 把 K/V 写入物理槽    | 已经手写了完整 FlashAttention                     | 16.7、28.10；[attention.py](nanovllm/layers/attention.py)                                                     |
+| **torch.distributed / NCCL**           | dist 是 Python 通信接口；nccl 是 GPU 通信后端，用于结果求和、词表收集及同步    | 启动 Python 子进程，或网络 HTTP 服务              | 第 19 章，尤其 19.9                                                                                          |
+| **multiprocessing / 共享内存 / Event** | 启动 worker；传方法名、Sequence 快照；通知 worker 读取控制消息                 | 用这条控制通道传输所有 GPU hidden states          | 19.6、19.8；[llm_engine.py](nanovllm/engine/llm_engine.py)、[model_runner.py](nanovllm/engine/model_runner.py) |
+| **Transformers**                       | 提供配置、tokenizer 和聊天模板等工具；当前实际网络由本地 Qwen3 代码执行        | 本项目完全调用 Transformers generate 完成所有推理 | 第 6、10、15 章                                                                                              |
+| **Safetensors**                        | 模型权重存储与读取工具；safe_open 读取参数                                     | tokenizer 编码格式，或 KV 缓存格式                | 第 18 章；[loader.py](nanovllm/utils/loader.py)                                                               |
+| **xxhash / NumPy**                     | 前者算前缀哈希，后者将 token 列表组织为数组字节供哈希使用                      | 神经网络生成 token 的计算器                       | 13.6、28.6；[block_manager.py](nanovllm/engine/block_manager.py)                                              |
 
 补充两条执行边界：
 
