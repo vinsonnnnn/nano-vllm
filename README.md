@@ -18,6 +18,8 @@ A lightweight vLLM implementation built from scratch.
 
 简历描述、面试开场讲解及分类问题与参考答案请见 [Nano-vLLM 简历与面试讲解指南](NANO_VLLM_INTERVIEW_GUIDE_ZH.md)。
 
+源码已添加中文教学注释；推荐阅读顺序、完整调用链、变量对照和实现边界请见 [中文源码阅读指南](SOURCE_READING_GUIDE_ZH.md)。
+
 ## Key Features
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
