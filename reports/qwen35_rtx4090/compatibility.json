@@ -1,0 +1,160 @@
+{
+  "official_bf16_alignment": {
+    "max_logit_abs_error_by_step": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "argmax_equal": true,
+    "teacher_forcing_steps": 4
+  },
+  "chunked_prefill": {
+    "argmax_equal": true,
+    "max_logit_abs_error": 0.171875,
+    "logical_length": 73,
+    "chunks": [
+      11,
+      62
+    ]
+  },
+  "request_lifecycle": {
+    "interleaving_equal": true,
+    "preempt_recompute_equal": true,
+    "cancel_reuse_equal": true,
+    "slots_released": true
+  },
+  "compression_hybrid_compatibility": {
+    "gdn_and_conv_bitwise_unchanged": true,
+    "logical_length": 73,
+    "retained_per_full_layer": [
+      48,
+      48,
+      48,
+      48,
+      48,
+      48
+    ],
+    "before": {
+      "kv_bytes": 897024,
+      "recurrent_bytes": 18874368,
+      "conv_bytes": 884736,
+      "observation_bytes": 196992,
+      "position_bytes": 3504
+    },
+    "after": {
+      "kv_bytes": 589824,
+      "recurrent_bytes": 18874368,
+      "conv_bytes": 884736,
+      "observation_bytes": 196992,
+      "position_bytes": 2304
+    }
+  },
+  "mtp_prototype": {
+    "loaded_mtp_tensor_count": 15,
+    "candidates": [
+      16,
+      13,
+      561
+    ],
+    "accepted": [
+      16,
+      13,
+      561
+    ],
+    "next_token": 11012,
+    "matches_fixed_compressed_target": true,
+    "forced_rejection_restores_gdn_conv_kv": true,
+    "draft_cache_unmodified": true,
+    "scope": "one-round real MTP draft + serial greedy target verification; no speedup claim or generate integration"
+  },
+  "mtp_generation": {
+    "greedy_equal_without_compression": true,
+    "tokens": [
+      16,
+      13,
+      561,
+      11012,
+      6522,
+      5435,
+      13640,
+      314,
+      9338,
+      321,
+      6265,
+      383
+    ],
+    "rounds": 3,
+    "draft_tokens": 6,
+    "accepted_draft_tokens": 6,
+    "bursts": [
+      4,
+      4,
+      4
+    ],
+    "serial_verification": true,
+    "speedup_claim": false
+  },
+  "mtp_compressed_generation": {
+    "tokens": [
+      16,
+      13,
+      561,
+      11012,
+      6522,
+      5435,
+      6265,
+      383,
+      78319,
+      13,
+      220,
+      17
+    ],
+    "compression_count": 2,
+    "slots_released": true,
+    "rounds": 4,
+    "draft_tokens": 6,
+    "accepted_draft_tokens": 5,
+    "bursts": [
+      4,
+      3,
+      4,
+      1
+    ],
+    "serial_verification": true,
+    "speedup_claim": false
+  },
+  "multimodal": {
+    "text": " red",
+    "visual_token_count": 64,
+    "all_visual_positions_retained": true,
+    "position_shape": [
+      3,
+      1,
+      249
+    ],
+    "finite_logits": true,
+    "metrics": {
+      "request_id": 10,
+      "input_tokens": 249,
+      "output_tokens": 2,
+      "ttft_ms": 176.90740001853555,
+      "tpot_ms": 33.77900004852563,
+      "itl_ms": [
+        33.77900004852563
+      ],
+      "decode_tokens_per_second": 29.604191911052368,
+      "kv_peak_bytes": 3059712,
+      "kv_final_bytes": 1585152,
+      "state_memory": {
+        "kv_bytes": 1585152,
+        "recurrent_bytes": 18874368,
+        "conv_bytes": 884736,
+        "observation_bytes": 196992,
+        "position_bytes": 6192
+      },
+      "compressions": 1,
+      "e2e_ms": 210.6864000670612
+    }
+  }
+}

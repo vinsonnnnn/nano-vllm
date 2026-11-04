@@ -16,10 +16,11 @@ class Sampler(nn.Module):
         不支持 top-k/top-p，max_tokens/EOS 由 Scheduler 处理，不由此函数判断。
         """
         # 步骤1：[B] 温度扩成 [B,1]，每条请求的一行词表分数使用各自温度。
-        logits = logits.float().div_(temperatures.unsqueeze(dim=1))
+        greedy = logits.argmax(dim=-1)
+        logits = logits.float() / temperatures.clamp_min(1e-10).unsqueeze(dim=1)
         # 步骤2：沿词表 V 归一化；每行概率和约为 1，logits 本身不是概率。
         probs = torch.softmax(logits, dim=-1)
         # 步骤3：为每个候选产生 Exp(1) 随机数，选择 p/e 最大项实现概率采样。
         # argmax 作用于随机化后的值，不是原始 logits；clamp 防止分母接近零。
         sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
-        return sample_tokens
+        return torch.where(temperatures == 0, greedy, sample_tokens)

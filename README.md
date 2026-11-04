@@ -22,6 +22,21 @@ A lightweight vLLM implementation built from scratch.
 
 ## Key Features
 
+### Qwen3.5 hybrid backend
+
+Dense Qwen3.5 now has a single-device eager backend with request-owned Gated
+DeltaNet state, image input, periodic attention-based KV compaction, block-FP8
+checkpoint dequantization, and an experimental real-weight greedy MTP path.
+
+See [改造说明与使用方法](docs/QWEN35_IMPLEMENTATION_ZH.md) and the
+[实测性能与质量报告](reports/qwen35_rtx4090/PERFORMANCE_REPORT_ZH.md).
+The hybrid backend uses reference kernels and compact dynamic tensors; TP,
+CUDA graphs and paged prefix sharing remain specific to the original Qwen3
+backend. MTP verification is serial and carries no speedup claim.
+
+Install the portable backend with `pip install -e ".[test,eval]"`; the original
+Qwen3 CUDA backend additionally needs `pip install -e ".[cuda]"` on Linux.
+
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
 * ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.

@@ -12,4 +12,7 @@ class SamplingParams:
 
     def __post_init__(self):
         """拒绝零/近零温度；当前 Sampler 只有随机采样路径，没有独立 greedy 分支。"""
-        assert self.temperature > 1e-10, "greedy sampling is not permitted"
+        if self.temperature < 0:
+            raise ValueError("temperature must be nonnegative (0 selects greedy decoding)")
+        if self.max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
